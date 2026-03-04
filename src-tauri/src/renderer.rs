@@ -65,14 +65,16 @@ pub fn start_worker(state: Arc<RenderState>) {
         let lib_name_str = lib_name_os.to_string_lossy().to_string();
         let pdfium_result = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join(&lib_name_os)))
-            .and_then(|dll_path| {
-                if dll_path.exists() {
-                    Pdfium::bind_to_library(&dll_path).ok()
-                } else {
-                    None
-                }
+            .and_then(|exe| {
+                let dir = exe.parent()?;
+                let paths = [
+                    dir.join(&lib_name_os),
+                    dir.join("resources").join(&lib_name_os),
+                    dir.join("_up_").join(&lib_name_os),
+                ];
+                paths.into_iter().find(|p| p.exists())
             })
+            .and_then(|path| Pdfium::bind_to_library(&path).ok())
             .or_else(|| Pdfium::bind_to_library(&lib_name_os).ok())
             .map(|lib| Pdfium::new(lib));
 

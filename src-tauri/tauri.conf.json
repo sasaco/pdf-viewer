@@ -45,6 +45,9 @@
         "description": "Portable Document Format",
         "role": "Viewer"
       }
+    ],
+    "resources": [
+      "pdfium.dll"
     ]
   }
 }
