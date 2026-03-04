@@ -1,48 +1,60 @@
-# PDF Viewer
+# PDF Viewer (High Performance Edition)
 
-Tauri v2 と PDF.js を使用して構築された、高速でモダンなデスクトップ向け PDF ビューアアプリケーションです。
+Tauri v2 と Rust + PDFium を使用して構築された、極めて高速で応答性の高いデスクトップ向け PDF ビューアアプリケーションです。
 
-## アプリケーション構成
+## プラットフォームのハイライト
 
-本アプリケーションは、以下の技術スタックを組み合わせて構築されています。
+従来の PDF.js のみのレンダリングから、**Rust エンジン (PDFium) によるネイティブレンダリング**へと刷新されました。
 
-*   **フロントエンド**: HTML / Vanilla CSS / Vanilla JS + Vite
-*   **バックエンド (デスクトップシェル)**: Tauri v2 (Rust)
-*   **PDF レンダリングコア**: PDF.js (`pdfjs-dist`)
+- **極限のレンダリング速度**: C++ ベースの PDFium エンジンと Rust の並列処理能力を活用。
+- **LIFO タスクキュー**: 最新スクロール位置を最優先でレンダリングする Last-In-First-Out キューを搭載。
+- **シリアライズ・ゼロ通信**: Tauri の `Response` API により Raw RGBA データを JSON 化せず直接転送。
+- **確実な中断機構**: 不要なレンダリングタスクを即座にキューから破棄してリソースを節約。
+- **BGRA→RGBA 変換**: PDFium の BGRA 出力を Canvas 向け RGBA に正しく変換。
 
-**構成の特徴:**
-PyMuPDFを使用したPython sidecar構成から脱却し、**Tauri プラグインと PDF.js のみで完結するシンプルで強力なアーキテクチャ**を採用しています。これにより、Python環境への依存やバンドルの複雑さが解消され、軽量で高速な配布・実行が可能になっています。
+## 技術スタック
+
+| 層 | 技術 |
+|---|---|
+| フロントエンド | HTML / Vanilla CSS / Vanilla JS + Vite |
+| バックエンド (描画) | Rust (Tauri v2) + `pdfium-render` |
+| メタデータ処理 | PDF.js (目次・テキストレイヤーのみ) |
+| 通信 | Tauri IPC `invoke` — 非圧縮バイナリ (`ArrayBuffer`) 転送 |
 
 ---
 
-## 主な機能 (仕様)
+## 主な機能
 
-*   **PDFファイルの表示**: 
-    *   Tauri の `plugin-dialog` でネイティブのファイル選択ダイアログを表示。
-    *   Tauri の `plugin-fs` を使用してローカルファイルを高速に読み込み (`Uint8Array`化)。
-    *   PDF.js により高画質でキャンバス (Canvas) にレンダリング。
-*   **ページナビゲーション**:
-    *   「前へ」「次へ」ボタンによる移動。
-    *   ページ番号の直接入力によるジャンプ。
-*   **ズームと表示制御**:
-    *   「拡大」「縮小」ボタンによるスケール変更。
-    *   「幅に合わせる」機能でウィンドウサイズにフィット。
-    *   ※ `Ctrl/Cmd` + マウスホイールによるスムーズなズーム対応。
-*   **テキスト検索**:
-    *   PDF.js の生成するテキストレイヤー (`text-layer`) に対する透過的なハイライト検索。
-    *   入力ごとにリアルタイムで一致するテキストをハイライト表示。
-*   **目次 (Table of Contents)**:
-    *   PDF内のアウトライン (しおり) を抽出し、サイドパネルに階層構造で表示。
-    *   目次項目をクリックすることで、該当の宛先 (Destination) ・ページへ即座に移動可能。
-*   **ダークモード UI**:
-    *   眼に優しいダークテーマベースのモダンなデザイン (Glassmorphism などを活用)。
-*   **キーボードショートカット**:
-    *   `←` / `→` (または `PageUp` / `PageDown`): ページ移動
-    *   `Home` / `End`: 最初 / 最後のページへ移動
-    *   `Ctrl/Cmd` + `+` / `-`: ズームイン / ズームアウト
-    *   `Ctrl/Cmd` + `0`: ズームリセット (100%)
-    *   `Ctrl/Cmd` + `O`: ファイルを開く
-    *   `Ctrl/Cmd` + `F`: テキスト検索にフォーカス
+### ページ表示・ナビゲーション
+- **ネイティブ PDF レンダリング**: PDFium による高速・高品質なネイティブ描画。
+- **ダイレクト Canvas 描画**: Raw ピクセルデータを直接 Canvas へ転送。
+- **高速ページめくり**: LIFO キューにより「今見ているページ」が常に最優先で描画。
+- **動的ズームレンダリング**: ズームレベルに応じてバックエンドで最適な解像度で再レンダリングし、拡大時も鮮明な画像を提供。
+
+### キーボード・マウス操作
+
+| 操作 | 機能 |
+|---|---|
+| `←` / `PageUp` | 前のページ |
+| `→` / `PageDown` | 次のページ |
+| `Shift` + ホイール | ページめくり（上: 前へ / 下: 次へ） |
+| `Ctrl/Cmd` + ホイール | ズームイン/アウト（解像度追従） |
+| `Ctrl/Cmd` + `+` / `-` | ズームイン/アウト |
+| `Ctrl/Cmd` + `0` | 100% にリセット |
+| `Ctrl/Cmd` + `O` | ファイルを開く |
+| `Ctrl/Cmd` + `F` | テキスト検索 |
+| `Home` / `End` | 最初/最後のページへ |
+
+### サイドバー（目次 / サムネイル）
+- **目次タブ**: PDF の目次（ブックマーク）を階層表示。クリックでジャンプ。
+- **サムネイルタブ**: 全ページのサムネイルを Rust/PDFium でレンダリング表示。
+  - **描画最適化**: サムネイル専用の解像度（200px）で直接レンダリング・転送することで、メモリと CPU 負荷を最小限に抑制。
+  - クリックでジャンプ。現在ページを自動ハイライト。
+
+### その他
+- **テキスト検索**: テキストレイヤーのハイライト検索。
+- **ダブルクリックで開く**: OS ファイルの関連付けによる直接起動対応。
+- **ドラッグ&ドロップ対応**。
 
 ---
 
@@ -50,85 +62,67 @@ PyMuPDFを使用したPython sidecar構成から脱却し、**Tauri プラグイ
 
 ```text
 PyMuPDF/
-├── src/                      # フロントエンドのソースコード
-│   ├── index.html            # UIの骨組み
-│   ├── style.css             # ダークモード対応のデザイン
-│   └── app.js                # PDF.js の制御と Tauri API 連携ロジック
-├── src-tauri/                # Tauri (Rust) バックエンドの設定
-│   ├── capabilities/
-│   │   └── default.json      # ファイル・ダイアログ操作の権限設定
+├── src/                        # フロントエンドのソースコード
+│   ├── index.html              # UI の骨組み（タブ付きサイドバー含む）
+│   ├── app.js                  # Rust レンダラーとの通信・UI ロジック
+│   └── style.css               # ダークモード対応デザイン
+├── src-tauri/                  # Tauri (Rust) バックエンド
 │   ├── src/
-│   │   ├── main.rs           # エントリポイント
-│   │   └── lib.rs            # プラグイン (fs, dialog) の初期登録
-│   ├── Cargo.toml            # Rust の依存関係
-│   └── tauri.conf.json       # アプリケーションのウィンドウやビルド設定
-├── package.json              # npm パッケージ (Vite, PDF.js, Tauri APIs)
-└── vite.config.js            # Vite のビルド・開発サーバー設定
+│   │   ├── main.rs             # エントリポイント
+│   │   ├── lib.rs              # コマンド登録・起動引数処理
+│   │   └── renderer.rs         # PDFium レンダラー / LIFO キュー / ワーカースレッド
+│   ├── pdfium.dll              # PDFium バイナリ (Windows)
+│   └── Cargo.toml              # Rust 依存関係 (pdfium-render, tokio 等)
+├── tests/                      # テストスイート
+│   ├── pdfium-renderer.test.js # フロントエンド通信テスト
+│   └── pdf-viewer.test.js      # ユーティリティテスト
 ```
 
 ---
 
-## 開発環境のセットアップと起動手順
+## 開発と実行
 
 ### 必要な環境
-*   [Node.js](https://nodejs.org/) (v16 以降推奨)
-*   [Rust](https://www.rust-lang.org/) (Cargo 含む)
-*   各種 OS における C++ ビルドツール (Windows の場合は `Desktop development with C++`)
+
+- [Node.js](https://nodejs.org/)
+- [Rust](https://www.rust-lang.org/)
+- PDFium バイナリ (`pdfium.dll`) — 実行ファイルと同じディレクトリに配置
 
 ### 起動手順
 
-1. 依存パッケージのインストール
 ```powershell
+# 1. 依存インストール
 npm install
-```
 
-2. 開発サーバーと Tauri アプリの起動
-```powershell
+# 2. 開発モードで起動
 npm run tauri dev
 ```
-※ 初回起動時は Rust クレート (約400個) のコンパイルが走るため、数分時間がかかります。2回目以降は即座に起動します。
 
-### Windowsインストーラーの生成
-
-#### ビルドコマンド
+### テスト
 
 ```powershell
-npm run tauri build
-```
+# バックエンド (Rust) — LIFO キューとキャンセルロジックの検証
+cd src-tauri
+cargo test
 
-> ⚠️ **初回ビルドは数分かかります。** Rust クレートのコンパイルが約 470 個走るため時間がかかりますが、2回目以降は差分コンパイルのみで大幅に短縮されます。
-
----
-
-#### 生成される成果物
-
-ビルド完了後、以下の 2 種類のインストーラーが自動生成されます。
-
-| 形式 | パス | 説明 |
-|------|------|------|
-| **NSIS インストーラー** (`.exe`) | `src-tauri\target\release\bundle\nsis\PDF Viewer_0.1.0_x64-setup.exe` | 一般的なウィザード形式のインストーラー。**通常の配布はこちらを推奨** |
-| **MSI インストーラー** (`.msi`) | `src-tauri\target\release\bundle\msi\PDF Viewer_0.1.0_x64_en-US.msi` | Windows Installer 形式。企業向けのグループポリシー配布などに対応 |
-
-アプリ本体の実行ファイル単体は以下に出力されます。
-
-```
-src-tauri\target\release\app.exe
+# フロントエンド (Vitest)
+npm test
 ```
 
 ---
 
-#### インストーラーの使い方
+## 実装上の注意点
 
-1. `PDF Viewer_0.1.0_x64-setup.exe` をダブルクリック
-2. インストールウィザードに従って操作
-3. スタートメニューまたはデスクトップのショートカットからアプリを起動
+| 項目 | 詳細 |
+|---|---|
+| IPC 戻り値の型 | `invoke()` が返す `Response` は **`ArrayBuffer`**。サイズは `.byteLength` で取得する（`.length` は `undefined`）|
+| PDFium のビットマップ形式 | **BGRA** 形式。Canvas `ImageData` に渡す前に **RGBA へ変換**すること |
+| ページインデックス | PDFium は **0-based**。フロントエンド（1-based）との変換に注意 |
+| 動的レンダリング幅 | フロントエンドの `state.scale` に基づき、`width` パラメータを Rust へ渡して適切な解像度でレンダリングする |
+| pdfium.dll の配置 | 実行ファイルと同じディレクトリが最優先。なければ PATH を検索 |
 
 ---
 
-#### 動作要件 (配布先 PC)
+## ライセンス
 
-| 項目 | 要件 |
-|------|------|
-| OS | Windows 10 / 11 (64-bit) |
-| WebView2 | Microsoft Edge WebView2 ランタイム (Windows 11 は標準搭載。Windows 10 は未導入の場合インストーラーが自動セットアップ) |
-| 追加ランタイム | 不要 (Node.js / Python / Rust は不要) |
+プロジェクトの目的と背景に合わせて設定してください。
