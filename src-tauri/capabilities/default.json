@@ -10,6 +10,25 @@
     "dialog:default",
     "dialog:allow-open",
     "fs:default",
-    "fs:allow-read-file"
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        {
+          "path": "$HOME/**"
+        },
+        {
+          "path": "$DOCUMENT/**"
+        },
+        {
+          "path": "$DESKTOP/**"
+        },
+        {
+          "path": "$DOWNLOAD/**"
+        },
+        {
+          "path": "**/*.pdf"
+        }
+      ]
+    }
   ]
 }

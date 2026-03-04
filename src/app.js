@@ -4,6 +4,7 @@
 
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
 
 // PDF.js worker setup
@@ -51,18 +52,10 @@ const els = {
 };
 
 // ---- PDF Loading ----
-async function openFile() {
+
+/** ファイルパスを直接渡してPDFを読み込む共通処理 */
+async function openFileByPath(filePath) {
     try {
-        const selected = await open({
-            multiple: false,
-            filters: [{ name: "PDF", extensions: ["pdf"] }],
-        });
-
-        if (!selected) return;
-
-        const filePath = typeof selected === "string" ? selected : selected.path;
-        if (!filePath) return;
-
         els.statusInfo.textContent = "読み込み中...";
         state.filePath = filePath;
 
@@ -100,6 +93,26 @@ async function openFile() {
         await renderPage(state.currentPage);
 
         els.statusInfo.textContent = "";
+    } catch (err) {
+        console.error("Failed to open PDF:", err);
+        els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
+    }
+}
+
+/** ダイアログでファイルを選択して開く */
+async function openFile() {
+    try {
+        const selected = await open({
+            multiple: false,
+            filters: [{ name: "PDF", extensions: ["pdf"] }],
+        });
+
+        if (!selected) return;
+
+        const filePath = typeof selected === "string" ? selected : selected.path;
+        if (!filePath) return;
+
+        await openFileByPath(filePath);
     } catch (err) {
         console.error("Failed to open PDF:", err);
         els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
@@ -419,4 +432,13 @@ document.addEventListener("drop", async (e) => {
     e.preventDefault();
     e.stopPropagation();
     // Tauri might pass file paths differently; this is a fallback
+});
+
+// ---- 起動引数 / ファイルダブルクリックで開く ----
+// Rust側から "open-pdf" イベントでパスが送信されてくる
+await listen("open-pdf", (event) => {
+    const filePath = event.payload;
+    if (filePath && filePath.toLowerCase().endsWith(".pdf")) {
+        openFileByPath(filePath);
+    }
 });

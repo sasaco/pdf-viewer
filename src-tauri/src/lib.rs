@@ -1,3 +1,5 @@
+use tauri::{Emitter, Manager};
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -11,6 +13,25 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // コマンドライン引数から PDF パスを取得し、フロントへ送信
+            let args: Vec<String> = std::env::args().collect();
+            // args[0] は実行ファイル自身なのでスキップ
+            let pdf_path = args
+                .iter()
+                .skip(1)
+                .find(|a| a.to_lowercase().ends_with(".pdf"))
+                .cloned();
+
+            if let Some(path) = pdf_path {
+                let window = app.get_webview_window("main").unwrap();
+                // フロントエンドが読み込まれた後に送信するため少し遅延させる
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let _ = window.emit("open-pdf", path);
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())
