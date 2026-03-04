@@ -1,357 +1,214 @@
-# PDF Viewer: PDF.js → Rust PDFium 移行計画 (最新版)
+# PDF Viewer: PDF.js → Rust PDFium 移行計画 (最新版 - アーキテクチャ刷新)
 
 ## 目的と背景
 
-現在のWebブラウザベースのPDFビューワ（PDF.js等）では、`C:\Users\sasai\Documents\PyMuPDF\tests\big.pdf` のような数百ページを超える大容量のPDFファイルを開き、紙を素早くめくるように高速にページを行き来しようとすると、レンダリングの遅延（カクつき）やメモリ不足によるクラッシュが発生するという課題があります。
+現在のWebブラウザベースのPDFビューワでのレンダリング遅延やメモリ不足によるクラッシュを解決するため、バックエンド（Rust + PDFium）でのネイティブレンダリングに移行します。
 
-本計画は、バックエンド（Rust + PDFium）で高速なネイティブレンダリングを行い、フロントエンドに直接ピクセルデータ（RGBA）を継続的にストリーミングするアーキテクチャへ刷新することで、**「どんなに巨大なPDFでも、紙の本をパラパラとめくるようなシームレスで高速な閲覧体験」** を実現することを目的としています。
-
-> **💡 設計のハイライト（最適化済）**
+> **💡 設計のハイライト（最新のアーキテクチャ・パフォーマンスレビュー反映済）**
 > 
-> 1. **メモリリークの解消とGC任せの管理**: JSの `ImageData` と HTML5 `<canvas>` を直接使うことで、Blob URLに起因するクラッシュを防止。
-> 2. **Rustでのメモリコピー最小化**: `pdfium-render` から得たデータを、Rust内で配列の再確保をせずインプレースでスワップして結合。
-> 3. **メイン画面とサムネイルの仮想スクロール化 (Virtual Scrolling)**: `IntersectionObserver` を用い、画面内に入った瞬間だけ描画を予約・実行。画面外に出たメインキャンバスは破棄し、スクロールバーの長さはダミー要素で保持。複雑なプリフェッチ管理・ページ推移管理ロジックを廃止。
-> 4. **非同期描画によるUIブロッキング回避**: `putImageData` の代わりに `createImageBitmap` を用い、メインスレッドのフリーズ・カクつきを防止。
+> 以前の「Tempファイル経由での画像配信」や「手動タスクキュー管理」にはディスクI/Oのボトルネックやメモリ枯渇のリスクがありました。これらを解決するためのインメモリ通信案も、不確実性や通信オーバーヘッドの指摘を受けたため、本計画は最終的に**Tauri IPCによるOne-shot待機型通信と、Raw RGBA+Canvasダイレクト描画による極限の最適化アーキテクチャ**へと方針を転換・洗練させています。
+>
+> 1. **エンコード負荷・シリアライズ負荷の完全排除（Rawバイナリ直接通信＋Canvas）**:
+>    BMP変換などの画像処理を行わず、Rust側からPDFiumが出力した**生のピクセルデータ（Raw RGBA）を無加工で**フロント側に返します。この際、Tauri IPCのバイナリ直接応答機能（`Response` API等）を用い、長大なバイト配列がJSONにエンコード・デコードされるオーバーヘッドを完全に回避します。
+>    *採用理由*: 本計画の主目的である「エンコード負荷の極小化」を達成し、最高クラスのパフォーマンスを引き出すためには、画像フォーマット変換やJSON文字列化等のあらゆる中間処理を削ぎ落とすことが必須であるためです。
+>
+> 2. **One-shot待機型のバックエンド非同期アーキテクチャ**:
+>    Tauriの `invoke` 実装において、`tokio::sync::oneshot` チャネルをタスクに同梱し、レンダリングが完了するまでRust側のコマンドハンドラで待機（`await`）してフロントへ直接解を返す設計へ変更しました。
+>    *採用理由*: 無闇な非同期イベントリスナー（イベントプル型）をフロントエンドに散りばめる複雑さを避け、JS側で `const data = await invoke(...)` と直感的に結果を待機・取得できるようにするためです。フロントの同期的なJS記述構造を維持する上で最も効果の高いアプローチです。
+>
+> 3. **処理の直列化と排他制御（Mutex）の排除**:
+>    単一のワーカースレッドがPDFiumインスタンス（PdfDocument）の所有権を独占し、キューからタスクをLIFOで取り出して処理する設計に変更しました。
+>    *採用理由*: バックエンドにワーカーが1つしか存在しないため、複数スレッドからの同時アクセスが物理的に起こらず、`Mutex`等の複雑な排他制御機構を丸ごと排除できます。これにより、ロック取得のオーバーヘッドやデッドロックのリスクが消え、コードも非常にシンプルになります。
+>
+> 4. **完全な仮想スクロール（Virtual Scrolling）の採用（継続）**:
+>    *採用理由*: 数万ページのPDFにおいてDOMリソースを抑え、「上限のないスクロールパフォーマンス」を確保・維持するためです。
+>
+> 5. **確実な中断機構（キャンセル状態管理の単純化）**:
+>    別個のHashSetを用いたキャンセルIDの管理をやめ、「フロントエンドから `cancel_render` 要求が来た時点で、ワーカースレッドの待機キュー(`queue`)自体から該当リクエストを即座に削除（Remove）する」間引き方式を採用しました。
+>    *採用理由*: 余分な状態管理を持たないことでメモリリークの懸念を排除し、ロジックをより堅牢・シンプルにするためです。PDFiumにおける「実行中タスク」の中途キャンセル可否が不明である現状において、確実にコントロール可能な「実行前タスクのキュー破棄」に注力することが最も妥当なアプローチです。
 
 ---
 
 ## Architecture Overview
 
 ```text
-Frontend (JS)                         Backend (Rust)
-─────────────                         ──────────────
+Frontend (JS/HTML)                                Backend (Rust Tauri)
+──────────────────                                ────────────────────
 
-IntersectionObserver (サムネイル & メイン画面監視)
-タスクキュー (可視状態のページのみレンダリング要求)
-  ↓
-invoke("render_page_rgba",...) ────>  Tauri Command → Mutexロック取得 
-                                         → PDFiumでレンダリング (BGRA)
-                                         → [Width(4Byte) + Height(4Byte) + RGBA(Vec<u8>)]
-                                         ※ RとBのスワップとヘッダ結合をゼロコピーで一括処理
-  ↓
-ArrayBufferからゼロコピー抽出
-createImageBitmap() で非同期変換
-<canvas> に描画 (画面外に出たら破棄)
+Virtual Scroller (DOMノードリサイクル)
+  │
+  ├─ [ページの表示要求]
+  │   const rawData = await invoke('request_render', { page: 1, req_id: 'A' }) 
+  │   │                                                        │ Tauri IPC (Command)
+  │   │                                                        ↓
+  │   │                                           [LIFOキューへ追加] 
+  │   │                                             ※ one-shotチャネル(sender)を同梱
+  │   │
+  │   │(※ スクロールアウトで不要になった場合)     [単一ワーカースレッド] (Mutex不要でPdfDocumentを独占)
+  │   │ invoke('cancel_render', { req_id: 'A' }) ─┼─ キューを検索し、req_id 'A' があれば即座に削除
+  │   │                                           │  (間引き処理。別管理のHashSet等は不要)
+  │   │                                           │
+  │   │                                           ├─ キューから最新タスク(LIFO)を取得
+  │   │                                           ├─ 該当ページをレンダリング (Pdfium)
+  │   │                                           ├─ Raw RGBA Byte Arrayとして取得
+  │   │                                           ├─ one-shotチャネル経由で Command に結果を返却
+  │   │                                           │  (Tauriのシリアライズ回避 Response 機能を利用)
+  │   <───────────────────────────────────────────┘
+  │      Response (Uint8Array / JSON化を経由しない生バイナリ)
+  │
+  ├─ [Canvas ダイレクト描画]
+  │   ctx.putImageData(...)
 ```
 
 **設計方針:**
-- **画像**: Rustから「ヘッダ8バイト（幅・高さ）＋RGBA生データ」を `Vec<u8>` として返し、JSの `ImageData` 経由で `<canvas>` に直接描画します。
-- **メモリ管理**: サムネイル・メイン画面ともに、`IntersectionObserver` によって画面内に見えているコンポーネントのみレンダリングします。画面外へ出た巨大なメインキャンバス要素はDOMから外してGCに回収させます。
+- **通信アーキテクチャの最適化と排他制御の排除**: One-shotチャネルを活用した待機型IPC応答により、フロントから安全に同期処理を記述可能とし、バックエンド側は単一スレッドのPDFium独占によってMutexロックの無駄を排除。
+- **キャンセル制御の単純・確実化**: 複数の状態変数を管理する複雑さを避け、キューからの実削除一本に間引き処理を絞り、スクロール詰まりを防止。
+- **エンコード・シリアライズ負荷の完全なゼロ化**: 非圧縮生データを扱い、かつTauriのシリアライズ回避レスポンスを用いることで、描画に関わるすべての計算コストを物理的に削ぎ落とす。
 
 ## Implementation Steps
 
-### Step 1: PDFiumバイナリの入手とRust依存関係
+### Step 1: 依存関係の整理
 
-**File: `src-tauri/Cargo.toml`** に追加:
+**File: `src-tauri/Cargo.toml`**
+画像フォーマットの変換（BMP等）は行わないため `image` クレートは不要となります。通信および同期基盤の依存のみを追加します。
+
 ```toml
-pdfium-render = { version = "0.8", features = ["sync"] } # imageフィーチャーは不要
+[dependencies]
+pdfium-render = { version = "0.8", features = ["sync", "thread_safe"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync"] }
 ```
 
-### Step 2: 型定義 (`src-tauri/src/pdf_engine.rs`)
+### Step 2: バックエンドIPCとLIFOキューの実装
+
+**File: `src-tauri/src/main.rs`**
+`tokio::sync::oneshot` と Tauriの `Response` (シリアライズ回避機能) を組み合わせて、非同期かつ生のバイナリ転送を実現します。
 
 ```rust
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PageSize {
-    pub width: f32,
-    pub height: f32,
+use tauri::{State, Manager, ipc::Response};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::oneshot;
+use std::collections::VecDeque;
+// その他必要なインポート（pdfiumの実装等）
+
+// タスクリクエストの定義
+struct RenderRequest {
+    req_id: String,
+    page_num: usize,
+    // レンダリング結果をTauriコマンドハンドラ(フロントへの応答)へ返すためのチャネル
+    responder: oneshot::Sender<Vec<u8>>,
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PdfInfo {
-    pub page_count: u32,
-    pub title: Option<String>,
-    pub pages: Vec<PageSize>,
+struct RenderState {
+    // 処理待ちキュー (Mutexで保護するがPdfDocumentは保護しない)
+    queue: StdMutex<VecDeque<RenderRequest>>,
+    // ※ 実際の運用ではスレッド起床用の Condvar や notify 等もここに含める
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutlineItem {
-    pub title: String,
-    pub page: u32,
-    pub children: Vec<OutlineItem>,
-}
-```
-
-### Step 3: PdfState (`src-tauri/src/pdf_state.rs`)
-
-```rust
-use pdfium_render::prelude::*;
-use std::sync::Mutex;
-
-pub struct PdfState {
-    pub document: Mutex<Option<PdfDocument<'static>>>,
-}
-```
-
-### Step 4: pdfium.dllのパス解決と初期化（`lib.rs` の setup 内）
-
-```rust
-.setup(|app| {
-    let dll_path = app.path()
-        .resolve("pdfium.dll", tauri::path::BaseDirectory::Resource)
-        .expect("リソースパス解決失敗");
-
-    let _pdfium = Box::leak(Box::new(Pdfium::new(
-        Pdfium::bind_to_library(&dll_path).expect("pdfium.dll ロード失敗")
-    )));
-
-    app.manage(PdfState {
-        document: Mutex::new(None),
-    });
-
-    Ok(())
-})
-```
-
-### Step 5: 画像レンダリングコマンド（最適化済 RGBA変換）
-
-**File: `src-tauri/src/commands.rs`**
-メモリコピーを最小化し、生データにインプレースでスワップをかけます。
-
-```rust
 #[tauri::command]
-pub fn render_page_rgba(state: tauri::State<PdfState>, page_num: u32, width: f32) -> Result<Vec<u8>, String> {
-    let mut doc_lock = state.document.lock().unwrap();
-    let doc = doc_lock.as_mut().ok_or("PDF is not loaded")?;
-
-    let page = doc.pages().get((page_num - 1) as u16).map_err(|e| e.to_string())?;
-
-    let mut config = PdfBitmapConfig::new();
-    config.scale_page_to_width(width as u16, &page);
-    let bitmap = page.render_with_config(&config).map_err(|e| e.to_string())?;
-
-    let bytes = bitmap.as_bytes();
-    let bmp_width = bitmap.width() as u32;
-    let bmp_height = bitmap.height() as u32;
-
-    // ヘッダ(8バイト) + ピクセルデータ用のベクタを一度だけ確保
-    let mut result = Vec::with_capacity(8 + bytes.len());
-    result.extend_from_slice(&bmp_width.to_le_bytes());
-    result.extend_from_slice(&bmp_height.to_le_bytes());
-    result.extend_from_slice(bytes);
-
-    // インプレースで R(0) と B(2) をスワップ (先頭8バイトのメタデータはスキップ)
-    for chunk in result[8..].chunks_exact_mut(4) {
-        chunk.swap(0, 2);
+async fn request_render(req_id: String, page_num: usize, state: State<'_, Arc<RenderState>>) -> Result<Response, String> {
+    // 戻り値受け取り用のOne-shotチャネルを生成
+    let (tx, rx) = oneshot::channel();
+    
+    {
+        let mut queue = state.queue.lock().unwrap();
+        // LIFO (最新のリクエストを優先) のため末尾に追加
+        queue.push_back(RenderRequest { req_id, page_num, responder: tx });
     }
+    
+    // ※ キュー追加後にワーカースレッドへ起床シグナルを送る
 
-    // Tauriは戻り値がトップレベルで Vec<u8> の場合、自動的にバイナリを最適化して送信する
-    Ok(result)
+    // ワーカースレッドからの処理完了(画像データ)を待機
+    match rx.await {
+        Ok(raw_rgba) => {
+            // JSONシリアライズ不可避の問題を回避するため、生バイナリ応答を生成
+            // (注: Tauriのバージョンによって生データ返却用のAPIは異なる。これはV2を想定)
+            Ok(Response::new(raw_rgba)) 
+        },
+        Err(_) => Err("Render cancelled".into())
+    }
+}
+
+#[tauri::command]
+fn cancel_render(req_id: String, state: State<'_, Arc<RenderState>>) {
+    let mut queue = state.queue.lock().unwrap();
+    // 該当するリクエストIDが未処理状態であれば、キューから直接破棄する (HashSet管理の廃止)
+    queue.retain(|req| req.req_id != req_id);
+}
+
+// ワーカースレッドの擬似コード
+/*
+tokio::spawn(async move {
+    // PdfDocumentインスタンスの所有権はワーカースレッドだけが持つ (Mutex不要)
+    // let pdfium_document = ...; 
+
+    loop {
+        let task = {
+            let mut queue = state.queue.lock().unwrap();
+            queue.pop_back() // LIFOで末尾から取得
+        };
+
+        if let Some(req) = task {
+            // pdfiumを用いたレンダリング処理を実行 (ロックを意識せず直接呼び出せる)
+            // let rgba = render_page(&pdfium_document, req.page_num);
+            
+            // チャネルを通じて `request_render` の `rx.await` に結果を送信
+            // let _ = req.responder.send(rgba);
+        } else {
+            // キューが空の場合は待機
+        }
+    }
+});
+*/
+
+fn main() {
+    // ... Tauri 初期化コード
 }
 ```
 
-### Step 6: フロントエンドUI構築（2カラム＆メインスクロール対応）
+### Step 3: フロントエンドUI構築 (Canvas直接描画)
 
-**File: `src/index.html`**
-```html
-<div id="app" style="display: flex; height: 100vh;">
-    <!-- 左側：サムネイルペイン -->
-    <div id="sidebar" style="width: 200px; min-width: 200px; overflow-y: auto; background: #2c2c2c; padding: 10px;">
-        <!-- サムネイルが動的に生成される -->
-    </div>
-    <!-- 右側：メインペイン（overflow: autoで連続スクロール可能に） -->
-    <div id="pdf-container" style="flex-grow: 1; overflow: auto; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; background: #1e1e1e; padding: 20px;">
-        <!-- メインキャンバスが仮想スクロールで挿入される -->
-    </div>
-</div>
-```
-
-### Step 7: フロントエンド書き換え (仮想スクロール & 非同期描画)
-
-**File: `src/app.js`**
+**File: `src/app.js` などのフロントエンドロジック**
+同期的に `await` で結果を受け取り、JSONのオーバーヘッドが取り除かれた `Uint8Array` を受け取って Canvas に転写します。
 
 ```javascript
 import { invoke } from '@tauri-apps/api/core';
 
-const state = {
-    pages: [],
-    totalPages: 0,
-    scale: 1.0,
-};
-
-const mainCache = new Map();  // pageNum -> HTMLCanvasElement
-const thumbCache = new Map(); // pageNum -> HTMLCanvasElement
-
-const els = {
-    pdfContainer: document.getElementById('pdf-container'),
-    sidebar: document.getElementById('sidebar'),
-};
-
-// --- サムネイル用 Observer ---
-const thumbObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-        if (entry.isIntersecting) {
-            const pageNum = parseInt(entry.target.dataset.page);
-            if (!thumbCache.has(pageNum)) {
-                requestRender(pageNum, true);
-            }
-        }
-    });
-}, { rootMargin: '100px' });
-
-// --- メイン画面用 Observer (仮想スクロール用) ---
-const mainObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-        const pageNum = parseInt(entry.target.dataset.page);
-        
-        if (entry.isIntersecting) {
-            // UI上の現在のページ枠線をアクティブに
-            document.querySelectorAll('.thumb-wrapper').forEach(el => el.style.border = 'none');
-            const targetThumb = document.getElementById(`thumb-wrapper-${pageNum}`);
-            if (targetThumb) targetThumb.style.border = '2px solid #007acc';
-
-            if (!mainCache.has(pageNum)) {
-                requestRender(pageNum, false);
-            }
-        } else {
-            // 画面外に出たページはCanvasを破棄してメモリ解放
-            if (mainCache.has(pageNum)) {
-                entry.target.replaceChildren(); // 子要素(Canvas)削除
-                mainCache.delete(pageNum);
-            }
-        }
-    });
-}, { rootMargin: '1000px' }); // 上下に多少の余裕をもたせる
-
-// --- レンダリングタスク管理 ---
-let isRendering = false;
-let renderQueue = []; 
-
-async function processRenderQueue() {
-    if (isRendering || renderQueue.length === 0) return;
+async function renderPageToCanvas(pageNum, canvasElement) {
+    const reqId = `req_${pageNum}_${Date.now()}`;
+    const ctx = canvasElement.getContext('2d');
     
-    // メイン画面(isThumb=false) を優先
-    renderQueue.sort((a, b) => (a.isThumb === b.isThumb ? 0 : a.isThumb ? 1 : -1));
-    const task = renderQueue.shift();
+    let isCancelled = false;
+    const cleanup = () => {
+        isCancelled = true;
+        // バックエンドのキューから直接削除させる
+        invoke('cancel_render', { req_id: reqId });
+    };
 
-    isRendering = true;
     try {
-        await executeRender(task);
-    } catch(e) {
-        console.error("Render failed", e);
+        // One-shot待機型のバックエンドによる実装により、結果を直接 await 可能。
+        // ※ Rawバイナリ応答を用いることで、JSONパースコスト無しの Uint8Array が返却される想定
+        const rawRgbaData = await invoke('request_render', { page_num: pageNum, req_id: reqId });
+        
+        // await を抜けた後に自身がキャンセル状態なら描画を破棄
+        if (isCancelled) return;
+
+        // 受け取った生データを用い ImageData を構成
+        const width = 800; // 仮の幅
+        const height = 1131; // 仮の高さ
+        const imageData = new ImageData(
+            new Uint8ClampedArray(rawRgbaData),
+            width,
+            height
+        );
+        ctx.putImageData(imageData, 0, 0);
+
+    } catch (error) {
+        if (!isCancelled) {
+            console.error("Render failed or cancelled:", error);
+        }
     }
-    isRendering = false;
-    processRenderQueue();
-}
 
-function requestRender(pageNum, isThumb = false) {
-    const cache = isThumb ? thumbCache : mainCache;
-    if (cache.has(pageNum)) return;
-    
-    const existing = renderQueue.find(t => t.pageNum === pageNum && t.isThumb === isThumb);
-    if (!existing) {
-        renderQueue.push({ pageNum, isThumb });
-        processRenderQueue();
-    }
-}
-
-async function executeRender(task) {
-    const { pageNum, isThumb } = task;
-    const cache = isThumb ? thumbCache : mainCache;
-
-    // すでにレンダリング済み、またはキュー待ち中に画面外へ出た場合はスキップ
-    if (cache.has(pageNum)) return;
-    const containerId = isThumb ? `thumb-container-${pageNum}` : `main-container-${pageNum}`;
-    const container = document.getElementById(containerId);
-    if (!container) return;
-
-    const { width: pw } = state.pages[pageNum - 1];
-    
-    // 解像度決定
-    const targetWidth = isThumb 
-        ? 150 
-        : Math.round(pw * state.scale * window.devicePixelRatio);
-    
-    const buffer = await invoke('render_page_rgba', { pageNum, width: targetWidth });
-    
-    // JSのバイナリパース (Uint8Arrayとして確実に取り扱う)
-    const uint8Arr = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    const arrayBuffer = uint8Arr.buffer;
-    const byteOffset = uint8Arr.byteOffset;
-
-    // 先頭8バイトのメタデータ
-    const view = new DataView(arrayBuffer, byteOffset, 8);
-    const w = view.getUint32(0, true);
-    const h = view.getUint32(4, true);
-
-    // 残りのデータ（RGB配列）をゼロコピーで抽出
-    const rgba = new Uint8ClampedArray(arrayBuffer, byteOffset + 8, w * h * 4);
-    const imageData = new ImageData(rgba, w, h);
-    
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    
-    if (isThumb) {
-        canvas.style.width = "100%";
-    } else {
-        canvas.style.width = (w / window.devicePixelRatio) + "px";
-        canvas.style.boxShadow = "0 4px 8px rgba(0,0,0,0.5)";
-    }
-    
-    const ctx = canvas.getContext('2d', { alpha: false });
-    
-    // putImageDataによるメインスレッドブロックを防ぐため非同期ImageBitmapを利用
-    const bitmap = await window.createImageBitmap(imageData);
-    ctx.drawImage(bitmap, 0, 0);
-    
-    cache.set(pageNum, canvas);
-
-    // コンテナが存在しかつ画面内にあるか（Observerでの判定前）簡易的にチェックして挿入
-    container.replaceChildren(canvas);
-}
-
-// PDF読み込み完了時のUI初期化ロジック
-export function initializePdf(info) {
-    state.pages = info.pages;
-    state.totalPages = info.pageCount;
-    els.sidebar.innerHTML = '';
-    els.pdfContainer.innerHTML = '';
-    
-    for (let i = 1; i <= state.totalPages; i++) {
-        const { width: pw, height: ph } = state.pages[i - 1];
-        
-        // --- サムネイル用 ---
-        const thumbWrapper = document.createElement('div');
-        thumbWrapper.id = `thumb-wrapper-${i}`;
-        thumbWrapper.className = 'thumb-wrapper';
-        thumbWrapper.style.marginBottom = '10px';
-        thumbWrapper.style.cursor = 'pointer';
-        thumbWrapper.onclick = () => {
-            const mainCont = document.getElementById(`main-container-${i}`);
-            if (mainCont) mainCont.scrollIntoView({ behavior: 'smooth' });
-        };
-        
-        const thumbContainer = document.createElement('div');
-        thumbContainer.id = `thumb-container-${i}`;
-        thumbContainer.dataset.page = i;
-        const thumbHeight = Math.round(150 * (ph / pw));
-        thumbContainer.style.minHeight = `${thumbHeight}px`; 
-        thumbContainer.style.background = '#333';
-        
-        thumbWrapper.appendChild(thumbContainer);
-        els.sidebar.appendChild(thumbWrapper);
-        thumbObserver.observe(thumbContainer); 
-
-        // --- メインページ用 ---
-        const mainContainer = document.createElement('div');
-        mainContainer.id = `main-container-${i}`;
-        mainContainer.dataset.page = i;
-        
-        const mainW = pw * state.scale;
-        const mainH = ph * state.scale;
-        mainContainer.style.width = `${mainW}px`;
-        mainContainer.style.minHeight = `${mainH}px`;
-        mainContainer.style.marginBottom = '20px';
-        mainContainer.style.background = '#333'; // プレースホルダー色
-        mainContainer.style.display = 'flex';
-        mainContainer.style.justifyContent = 'center';
-        
-        els.pdfContainer.appendChild(mainContainer);
-        mainObserver.observe(mainContainer);
-    }
+    return cleanup;
 }
 ```
 
@@ -359,14 +216,6 @@ export function initializePdf(info) {
 
 | File | Action |
 |---|---|
-| `src-tauri/Cargo.toml` | pdfium-render[sync]追加。tauri-plugin-fs削除。 |
-| `src-tauri/src/pdf_state.rs` | `Mutex<Option<PdfDocument>>` の追加 |
-| `src-tauri/src/commands.rs` | `render_page_rgba` を追加。データ確保の1回処理とインプレース変換で極限まで高速化。 |
-| `src/app.js` | 仮想スクロールによるレンダリング管理。非同期描画、確実なバイナリパース。 |
-| `src/index.html` | メインページの連続スクロールに対応。 |
-
-## Notes (改善ハイライト)
-
-- **自動ガベージコレクション対応**: Blob URLによるメモリリークの危険性を完全に排除。
-- **カクつきの無い連続スクロール**: メインペインにもVirtual Scrolling機構を導入。巨大なPDFでも、DOMに存在するのは画面付近のCanvasのみとなり、Chrome内蔵ビューワと同等のシームレスな体験を実現。
-- **高速描画**: Rust側での不必要なメモリコピーの排除と、JS側での非同期描画 (`createImageBitmap`) により、UIのフリーズが起きません。
+| `src-tauri/Cargo.toml` | `image` クレートを削除し、純粋なPDF解析とタスク制御のための依存のみに整理。 |
+| `src-tauri/src/main.rs` | Custom Protocolから脱却し、One-shotチャネルとTauriのRaw Responseによる待機型IPC (`invoke`) へ移行。<br>キャンセル管理の削減（HashSetから、キューの直接 `retain` による削除へ変更）、および `PdfDocument` に対する `Mutex` の完全排除（単一スレッドによる独占保有化）。 |
+| `src/app.js` | `<canvas>`＋RGBAアレイ直接描画への変更。`await` で通信終了と同時に結果を同期待機できるシンプルで高速な構造を実現し、スクロールアウト時は `cancel_render` で確実にバックエンドに間引きを指示する。 |

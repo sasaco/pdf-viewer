@@ -2,12 +2,13 @@
    PDF Viewer - Application Logic
    ============================================ */
 
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readFile } from "@tauri-apps/plugin-fs";
+// import { readFile } from "@tauri-apps/plugin-fs"; // No longer needed for main rendering
 import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
 
-// PDF.js worker setup
+// PDF.js worker setup (Keeping for TOC/TextLayer for now)
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
     "pdfjs-dist/build/pdf.worker.mjs",
     import.meta.url
@@ -23,6 +24,7 @@ const state = {
     rendering: false,
     pendingPage: null,
     outline: null,
+    currentReqId: null,
 };
 
 // ---- DOM Elements ----
@@ -59,12 +61,9 @@ async function openFileByPath(filePath) {
         els.statusInfo.textContent = "読み込み中...";
         state.filePath = filePath;
 
-        // Read file bytes via Tauri fs plugin
-        const fileBytes = await readFile(filePath);
-
-        // Load PDF with PDF.js
-        const typedArray = new Uint8Array(fileBytes);
-        const loadingTask = pdfjsLib.getDocument({ data: typedArray });
+        // Load PDF with PDF.js for metadata/numPages
+        // (In future we could get numPages from Rust too)
+        const loadingTask = pdfjsLib.getDocument(filePath);
         const pdf = await loadingTask.promise;
 
         state.pdf = pdf;
@@ -121,72 +120,85 @@ async function openFile() {
 
 // ---- Page Rendering ----
 async function renderPage(pageNum) {
-    if (!state.pdf) return;
+    if (!state.filePath) return;
 
-    if (state.rendering) {
-        state.pendingPage = pageNum;
-        return;
+    // キャンセル通知（前のリクエストがあれば）
+    if (state.currentReqId) {
+        invoke('cancel_render', { reqId: state.currentReqId });
     }
 
-    state.rendering = true;
+    const reqId = `req_${pageNum}_${Date.now()}`;
+    state.currentReqId = reqId;
     state.currentPage = pageNum;
     els.pageInput.value = pageNum;
     updateNavButtons();
 
     try {
-        const page = await state.pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale: state.scale * window.devicePixelRatio });
-        const displayViewport = page.getViewport({ scale: state.scale });
+        // Rustバックエンドから生のRGBAデータを取得 (Tauri IPC Response)
+        // pageNumは0オリジンとして送信
+        const rawRgbaData = await invoke('request_render', {
+            pageNum: pageNum - 1,
+            reqId: reqId
+        });
+
+        // 応答を待っている間に別のリクエストが走っていたら破棄
+        if (state.currentReqId !== reqId) return;
+
+        // 受け取った生データを用い ImageData を構成
+        const width = 800; // renderer.rs の設定に合わせる
+        const height = Math.floor(rawRgbaData.length / 4 / width);
 
         const canvas = els.canvas;
-        const context = canvas.getContext("2d");
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-        canvas.style.width = displayViewport.width + "px";
-        canvas.style.height = displayViewport.height + "px";
+        const ctx = canvas.getContext('2d');
+        canvas.width = width;
+        canvas.height = height;
 
-        const renderContext = {
-            canvasContext: context,
-            viewport: viewport,
-        };
+        const imageData = new ImageData(
+            new Uint8ClampedArray(rawRgbaData),
+            width,
+            height
+        );
+        ctx.putImageData(imageData, 0, 0);
 
-        await page.render(renderContext).promise;
-
-        // Build text layer
-        els.textLayer.innerHTML = "";
-        const textContent = await page.getTextContent();
-        const textItems = textContent.items;
-
-        for (const item of textItems) {
-            const span = document.createElement("span");
-            const tx = pdfjsLib.Util.transform(
-                displayViewport.transform,
-                item.transform
-            );
-
-            const fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
-            span.style.left = tx[4] + 24 + "px"; // 24px padding offset
-            span.style.top = tx[5] - fontSize + 24 + "px";
-            span.style.fontSize = fontSize + "px";
-            span.style.fontFamily = item.fontName || "sans-serif";
-            span.textContent = item.str;
-
-            els.textLayer.appendChild(span);
+        // テキストレイヤーの更新 (PDF.jsを併用)
+        if (state.pdf) {
+            updateTextLayer(pageNum);
         }
 
         els.statusInfo.textContent = `${pageNum} / ${state.totalPages} ページ`;
     } catch (err) {
-        console.error("Render error:", err);
-    }
-
-    state.rendering = false;
-
-    if (state.pendingPage !== null) {
-        const nextPage = state.pendingPage;
-        state.pendingPage = null;
-        renderPage(nextPage);
+        if (state.currentReqId === reqId) {
+            console.error("Render error:", err);
+        }
     }
 }
+
+async function updateTextLayer(pageNum) {
+    try {
+        const page = await state.pdf.getPage(pageNum);
+        const width = 800;
+        const viewport = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
+
+        els.textLayer.innerHTML = "";
+        const textContent = await page.getTextContent();
+
+        for (const item of textContent.items) {
+            const span = document.createElement("span");
+            const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+            const fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
+
+            span.style.left = tx[4] + "px";
+            span.style.top = (tx[5] - fontSize) + "px";
+            span.style.fontSize = fontSize + "px";
+            span.style.fontFamily = item.fontName || "sans-serif";
+            span.textContent = item.str;
+            els.textLayer.appendChild(span);
+        }
+    } catch (err) {
+        console.error("Text layer error:", err);
+    }
+}
+
 
 // ---- Navigation ----
 function goToPage(pageNum) {
