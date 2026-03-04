@@ -2,19 +2,20 @@
    PDF Viewer - Application Logic
    ============================================ */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-// import { readFile } from "@tauri-apps/plugin-fs"; // No longer needed for main rendering
+// import { readFile } from "@tauri-apps/plugin-fs"; 
 import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
 
-// PDF.js worker setup (Keeping for TOC/TextLayer for now)
+// PDF.js worker setup
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
     "pdfjs-dist/build/pdf.worker.mjs",
     import.meta.url
 ).toString();
 
 // ---- State ----
+const BASE_RENDER_WIDTH = 800;
 const state = {
     pdf: null,
     currentPage: 1,
@@ -38,6 +39,8 @@ const els = {
     btnFitWidth: document.getElementById("btn-fit-width"),
     btnToc: document.getElementById("btn-toc"),
     btnTocClose: document.getElementById("btn-toc-close"),
+    tabToc: document.getElementById("tab-toc"),
+    tabThumbnails: document.getElementById("tab-thumbnails"),
     pageInput: document.getElementById("page-input"),
     pageTotal: document.getElementById("page-total"),
     zoomLevel: document.getElementById("zoom-level"),
@@ -48,6 +51,7 @@ const els = {
     textLayer: document.getElementById("text-layer"),
     tocPanel: document.getElementById("toc-panel"),
     tocList: document.getElementById("toc-list"),
+    thumbnailList: document.getElementById("thumbnail-list"),
     fileName: document.getElementById("file-name"),
     statusInfo: document.getElementById("status-info"),
     viewerContainer: document.getElementById("viewer-container"),
@@ -61,15 +65,22 @@ async function openFileByPath(filePath) {
         els.statusInfo.textContent = "読み込み中...";
         state.filePath = filePath;
 
-        // Load PDF with PDF.js for metadata/numPages
-        // (In future we could get numPages from Rust too)
-        const loadingTask = pdfjsLib.getDocument(filePath);
-        const pdf = await loadingTask.promise;
-
-        state.pdf = pdf;
-        state.totalPages = pdf.numPages;
+        // 1. RustバックエンドでPDFをロードし、ページ数を取得
+        const totalPages = await invoke('load_pdf', { path: filePath });
+        state.totalPages = totalPages;
         state.currentPage = 1;
         state.scale = 1.0;
+
+        // 2. メタデータ（目次など）のために PDF.js でもロード（convertFileSrcを使用）
+        try {
+            const assetUrl = convertFileSrc(filePath);
+            const loadingTask = pdfjsLib.getDocument(assetUrl);
+            state.pdf = await loadingTask.promise;
+            loadOutline();
+        } catch (pdfjsErr) {
+            console.warn("PDF.js metadata load failed, TOC/Text search might be unavailable:", pdfjsErr);
+            state.pdf = null;
+        }
 
         // Update UI
         els.pageTotal.textContent = state.totalPages;
@@ -85,18 +96,16 @@ async function openFileByPath(filePath) {
         updateNavButtons();
         updateZoomDisplay();
 
-        // Load outline
-        loadOutline();
-
         // Render first page
         await renderPage(state.currentPage);
 
         els.statusInfo.textContent = "";
     } catch (err) {
         console.error("Failed to open PDF:", err);
-        els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
+        els.statusInfo.textContent = `エラー: ファイルを開けませんでした (${err})`;
     }
 }
+
 
 /** ダイアログでファイルを選択して開く */
 async function openFile() {
@@ -136,39 +145,54 @@ async function renderPage(pageNum) {
     try {
         // Rustバックエンドから生のRGBAデータを取得 (Tauri IPC Response)
         // pageNumは0オリジンとして送信
+        const renderWidth = Math.round(BASE_RENDER_WIDTH * state.scale);
         const rawRgbaData = await invoke('request_render', {
             pageNum: pageNum - 1,
-            reqId: reqId
+            reqId: reqId,
+            width: renderWidth
         });
 
         // 応答を待っている間に別のリクエストが走っていたら破棄
         if (state.currentReqId !== reqId) return;
 
-        // 受け取った生データを用い ImageData を構成
-        const width = 800; // renderer.rs の設定に合わせる
-        const height = Math.floor(rawRgbaData.length / 4 / width);
+        // invoke() が返す IPC Response は ArrayBuffer なので .byteLength を使う
+        // (.length は ArrayBuffer には存在しないため undefined になる)
+        const width = renderWidth;
+        const byteLen = rawRgbaData.byteLength ?? rawRgbaData.length;
+        const height = Math.floor(byteLen / 4 / width);
+
+        if (height <= 0) {
+            console.error("Render error: invalid height calculated. byteLen=", byteLen, "rawRgbaData=", rawRgbaData);
+            els.statusInfo.textContent = "描画エラー: データサイズ不正";
+            return;
+        }
 
         const canvas = els.canvas;
         const ctx = canvas.getContext('2d');
         canvas.width = width;
         canvas.height = height;
 
-        const imageData = new ImageData(
-            new Uint8ClampedArray(rawRgbaData),
-            width,
-            height
-        );
+        // ArrayBuffer または number[] どちらでも対応
+        const uint8 = rawRgbaData instanceof ArrayBuffer
+            ? new Uint8ClampedArray(rawRgbaData)
+            : new Uint8ClampedArray(rawRgbaData);
+
+        const imageData = new ImageData(uint8, width, height);
         ctx.putImageData(imageData, 0, 0);
 
-        // テキストレイヤーの更新 (PDF.jsを併用)
+        // テキストレイヤーの更新 (PDF.jsを併用、失敗しても描画には影響しない)
         if (state.pdf) {
             updateTextLayer(pageNum);
         }
+
+        // サムネイルのアクティブ状態を同期
+        syncThumbnailActive(pageNum);
 
         els.statusInfo.textContent = `${pageNum} / ${state.totalPages} ページ`;
     } catch (err) {
         if (state.currentReqId === reqId) {
             console.error("Render error:", err);
+            els.statusInfo.textContent = `描画エラー: ${err}`;
         }
     }
 }
@@ -176,7 +200,7 @@ async function renderPage(pageNum) {
 async function updateTextLayer(pageNum) {
     try {
         const page = await state.pdf.getPage(pageNum);
-        const width = 800;
+        const width = Math.round(BASE_RENDER_WIDTH * state.scale);
         const viewport = page.getViewport({ scale: width / page.getViewport({ scale: 1 }).width });
 
         els.textLayer.innerHTML = "";
@@ -202,7 +226,8 @@ async function updateTextLayer(pageNum) {
 
 // ---- Navigation ----
 function goToPage(pageNum) {
-    if (!state.pdf) return;
+    // state.pdf (PDF.js) がなくてもRust側でレンダリングできるため totalPages でチェック
+    if (state.totalPages === 0) return;
     const page = Math.max(1, Math.min(pageNum, state.totalPages));
     if (page !== state.currentPage) {
         renderPage(page);
@@ -218,15 +243,17 @@ function nextPage() {
 }
 
 function updateNavButtons() {
-    els.btnPrev.disabled = !state.pdf || state.currentPage <= 1;
-    els.btnNext.disabled = !state.pdf || state.currentPage >= state.totalPages;
+    const noFile = state.totalPages === 0;
+    els.btnPrev.disabled = noFile || state.currentPage <= 1;
+    els.btnNext.disabled = noFile || state.currentPage >= state.totalPages;
 }
 
 // ---- Zoom ----
 function setZoom(newScale) {
     state.scale = Math.max(0.25, Math.min(5.0, newScale));
     updateZoomDisplay();
-    if (state.pdf) {
+    // filePath があればRust側で再レンダリング可能
+    if (state.filePath) {
         renderPage(state.currentPage);
     }
 }
@@ -240,12 +267,20 @@ function zoomOut() {
 }
 
 async function fitWidth() {
-    if (!state.pdf) return;
-    const page = await state.pdf.getPage(state.currentPage);
-    const viewport = page.getViewport({ scale: 1.0 });
-    const containerWidth = els.viewerContainer.clientWidth - 80; // padding
-    const newScale = containerWidth / viewport.width;
-    setZoom(newScale);
+    if (state.totalPages === 0) return;
+    // PDF.js が利用可能な場合は正確な幅を計算、そうでなければデフォルト幅を使用
+    if (state.pdf) {
+        const page = await state.pdf.getPage(state.currentPage);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const containerWidth = els.viewerContainer.clientWidth - 80;
+        const newScale = containerWidth / viewport.width;
+        setZoom(newScale);
+    } else {
+        // PDF.js なしでも幅調整：Rustは基準幅比率で計算
+        const containerWidth = els.viewerContainer.clientWidth - 80;
+        const newScale = containerWidth / BASE_RENDER_WIDTH;
+        setZoom(newScale);
+    }
 }
 
 function updateZoomDisplay() {
@@ -402,14 +437,23 @@ function handleKeyboard(e) {
     }
 }
 
-// ---- Mouse Wheel Zoom ----
+// ---- Mouse Wheel Zoom & Page Turn ----
 function handleWheel(e) {
     if (e.ctrlKey || e.metaKey) {
+        // Ctrl+ホイール: ズーム
         e.preventDefault();
         if (e.deltaY < 0) {
             zoomIn();
         } else {
             zoomOut();
+        }
+    } else if (e.shiftKey) {
+        // Shift+ホイール: ページモード
+        e.preventDefault();
+        if (e.deltaY < 0 || e.deltaX < 0) {
+            prevPage();
+        } else {
+            nextPage();
         }
     }
 }
@@ -425,6 +469,8 @@ els.btnFitWidth.addEventListener("click", fitWidth);
 els.btnToc.addEventListener("click", toggleToc);
 els.btnTocClose.addEventListener("click", toggleToc);
 els.searchInput.addEventListener("input", handleSearch);
+els.tabToc.addEventListener("click", () => switchSidebarTab("toc"));
+els.tabThumbnails.addEventListener("click", () => switchSidebarTab("thumbnails"));
 
 document.addEventListener("keydown", handleKeyboard);
 els.viewerContainer.addEventListener("wheel", handleWheel, { passive: false });
@@ -446,7 +492,107 @@ document.addEventListener("drop", async (e) => {
     // Tauri might pass file paths differently; this is a fallback
 });
 
-// ---- 起動引数 / ファイルダブルクリックで開く ----
+// ---- Thumbnail Sidebar ----
+let thumbnailAbortController = null;
+
+async function buildThumbnails() {
+    if (state.totalPages === 0) return;
+
+    // 前回のサムネイル生成をキャンセル
+    if (thumbnailAbortController) thumbnailAbortController.abort();
+    thumbnailAbortController = new AbortController();
+    const { signal } = thumbnailAbortController;
+
+    els.thumbnailList.innerHTML = "";
+
+    // 先にプレースホルダーを作成してページ数を表示
+    for (let i = 1; i <= state.totalPages; i++) {
+        const item = document.createElement("div");
+        item.className = "thumbnail-item" + (i === state.currentPage ? " active" : "");
+        item.dataset.page = i;
+        item.addEventListener("click", () => goToPage(i));
+
+        const placeholder = document.createElement("div");
+        placeholder.className = "thumbnail-loading";
+        placeholder.textContent = `${i} ページ読み込み中...`;
+
+        const pageNum = document.createElement("span");
+        pageNum.className = "thumbnail-page-num";
+        pageNum.textContent = i;
+
+        item.appendChild(placeholder);
+        item.appendChild(pageNum);
+        els.thumbnailList.appendChild(item);
+    }
+
+    // 1枚ずつ順番にレンダリング（並列化せずキャンセル可能）
+    for (let i = 1; i <= state.totalPages; i++) {
+        if (signal.aborted) break;
+
+        try {
+            const THUMB_WIDTH = 200;
+            const reqId = `thumb_${i}_${Date.now()}`;
+            const rawRgbaData = await invoke('request_render', {
+                pageNum: i - 1,
+                reqId,
+                width: THUMB_WIDTH
+            });
+
+            if (signal.aborted) break;
+
+            const byteLen = rawRgbaData.byteLength ?? rawRgbaData.length;
+            const height = Math.floor(byteLen / 4 / THUMB_WIDTH);
+            if (height <= 0) continue;
+
+            const thumbCanvas = document.createElement("canvas");
+            thumbCanvas.className = "thumbnail-canvas";
+            thumbCanvas.width = THUMB_WIDTH;
+            thumbCanvas.height = height;
+            const ctx = thumbCanvas.getContext("2d");
+
+            const uint8 = rawRgbaData instanceof ArrayBuffer
+                ? new Uint8ClampedArray(rawRgbaData)
+                : new Uint8ClampedArray(rawRgbaData);
+
+            ctx.putImageData(new ImageData(uint8, THUMB_WIDTH, height), 0, 0);
+
+            // プレースホルダーをキャンバスに差し替え
+            const item = els.thumbnailList.querySelector(`[data-page="${i}"]`);
+            if (item) {
+                const placeholder = item.querySelector(".thumbnail-loading");
+                if (placeholder) item.replaceChild(thumbCanvas, placeholder);
+            }
+        } catch (err) {
+            if (!signal.aborted) console.warn(`Thumbnail render failed for page ${i}:`, err);
+        }
+    }
+}
+
+/** 現在ページのサムネイルアクティブ状態を更新 */
+function syncThumbnailActive(pageNum) {
+    const items = els.thumbnailList.querySelectorAll(".thumbnail-item");
+    items.forEach(item => {
+        const isActive = parseInt(item.dataset.page) === pageNum;
+        item.classList.toggle("active", isActive);
+        if (isActive) {
+            item.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        }
+    });
+}
+
+// ---- Sidebar Tab Switch ----
+function switchSidebarTab(tab) {
+    const isThumb = tab === "thumbnails";
+    els.tabToc.classList.toggle("active", !isThumb);
+    els.tabThumbnails.classList.toggle("active", isThumb);
+    els.tocList.classList.toggle("hidden", isThumb);
+    els.thumbnailList.classList.toggle("hidden", !isThumb);
+
+    // 初回タブ表示時にサムネイルを生成
+    if (isThumb && els.thumbnailList.children.length === 0) {
+        buildThumbnails();
+    }
+}
 // Rust側から "open-pdf" イベントでパスが送信されてくる
 await listen("open-pdf", (event) => {
     const filePath = event.payload;
