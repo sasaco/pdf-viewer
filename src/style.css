@@ -557,6 +557,7 @@ body {
   position: relative;
   display: inline-block;
   flex-shrink: 0;
+  z-index: 10;
 }
 
 #pdf-canvas {

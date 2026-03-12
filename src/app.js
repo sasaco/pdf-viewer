@@ -188,8 +188,15 @@ async function renderPage(pageNum) {
         const context = canvas.getContext("2d");
         canvas.height = viewport.height;
         canvas.width = viewport.width;
-        canvas.style.width = displayViewport.width + "px";
-        canvas.style.height = displayViewport.height + "px";
+
+        const widthPx = displayViewport.width + "px";
+        const heightPx = displayViewport.height + "px";
+        canvas.style.width = widthPx;
+        canvas.style.height = heightPx;
+
+        // Sync wrapper size
+        els.bookDepthWrapper.style.width = widthPx;
+        els.bookDepthWrapper.style.height = heightPx;
 
         const renderContext = {
             canvasContext: context,
@@ -281,7 +288,11 @@ function getHighlightedLayerIndex(currentPage, numPages, numLayers) {
 function updateBookEdges() {
     if (!state.pdf) return;
     const wrapper = els.bookDepthWrapper;
-    wrapper.querySelectorAll('.page-edge-layer').forEach(el => el.remove());
+    
+    // 現在のキャンバス要素を退避し、ラッパーの中身を空にしてから戻す（安全で確実なクリア）
+    const canvas = els.canvas;
+    wrapper.innerHTML = '';
+    wrapper.appendChild(canvas);
 
     const numLayers = calcNumLayers(state.currentPage, state.totalPages);
     if (numLayers === 0) return;
@@ -673,8 +684,12 @@ function handleWheel(e) {
 // Book depth: イベント委譲で一度だけ登録
 els.bookDepthWrapper.addEventListener('click', (e) => {
     const edge = e.target.closest('.page-edge-layer');
-    if (!edge) return;
-    goToPage(Number(edge.dataset.targetPage));
+    if (!edge || !edge.dataset.targetPage) return; // targetPageが無い場合は無視
+    
+    const pageNum = Number(edge.dataset.targetPage);
+    if (!isNaN(pageNum)) {
+        goToPage(pageNum);
+    }
 });
 
 els.btnOpen.addEventListener("click", openFile);
