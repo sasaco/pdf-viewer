@@ -13,6 +13,16 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
     import.meta.url
 ).toString();
 
+// ---- Book Depth Config ----
+const BOOK_DEPTH = {
+    pagesPerLayer: 50,
+    maxLayers: 6,
+    step: 2,
+    edgeColor: '#e8e8e8',
+    gapColor: 'rgba(0,0,0,0.15)',
+    ambientShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
+};
+
 // ---- State ----
 const state = {
     pdf: null,
@@ -109,6 +119,7 @@ async function openFileFromData(uint8Array, fileName) {
 
         // Initialize thumbnails AFTER basic render setup
         await renderPage(state.currentPage);
+        updateBookDepth();
         initThumbnails();
 
         els.statusInfo.textContent = "";
@@ -230,6 +241,7 @@ function goToPage(pageNum) {
     const page = Math.max(1, Math.min(pageNum, state.totalPages));
     if (page !== state.currentPage) {
         renderPage(page);
+        updateBookDepth();
     }
 }
 
@@ -244,6 +256,30 @@ function nextPage() {
 function updateNavButtons() {
     els.btnPrev.disabled = !state.pdf || state.currentPage <= 1;
     els.btnNext.disabled = !state.pdf || state.currentPage >= state.totalPages;
+}
+
+// ---- Book Depth ----
+function calcBookDepthLayers(currentPage, totalPages) {
+    const remaining = totalPages - currentPage;
+    return Math.min(BOOK_DEPTH.maxLayers, Math.ceil(remaining / BOOK_DEPTH.pagesPerLayer));
+}
+
+function generateBookShadow(layers) {
+    if (layers <= 0) return BOOK_DEPTH.ambientShadow;
+    const shadows = [];
+    for (let i = 1; i <= layers; i++) {
+        const o = i * BOOK_DEPTH.step;
+        shadows.push(`${o - 1}px ${o - 1}px 0 0 ${BOOK_DEPTH.edgeColor}`);
+        shadows.push(`${o}px ${o}px 0 0 ${BOOK_DEPTH.gapColor}`);
+    }
+    const total = layers * BOOK_DEPTH.step;
+    shadows.push(`${total + 4}px ${total + 4}px 16px rgba(0,0,0,0.4)`);
+    return shadows.join(', ');
+}
+
+function updateBookDepth() {
+    const layers = calcBookDepthLayers(state.currentPage, state.totalPages);
+    els.canvas.style.boxShadow = generateBookShadow(layers);
 }
 
 // ---- Zoom ----

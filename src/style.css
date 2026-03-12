@@ -542,6 +542,8 @@ body {
 #pdf-container {
   position: relative;
   padding: 24px;
+  padding-right: 40px;
+  padding-bottom: 40px;
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -552,9 +554,9 @@ body {
 }
 
 #pdf-canvas {
-  box-shadow: var(--shadow-md);
   border-radius: 2px;
   background: white;
+  transition: box-shadow 0.3s ease;
 }
 
 #text-layer {
