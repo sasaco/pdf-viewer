@@ -390,7 +390,7 @@ function handleKeyboard(e) {
     }
 }
 
-// ---- Mouse Wheel Zoom ----
+// ---- Mouse Wheel Zoom / Page Turn ----
 function handleWheel(e) {
     if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
@@ -398,6 +398,13 @@ function handleWheel(e) {
             zoomIn();
         } else {
             zoomOut();
+        }
+    } else if (e.shiftKey) {
+        e.preventDefault();
+        if (e.deltaY < 0) {
+            prevPage();
+        } else {
+            nextPage();
         }
     }
 }
