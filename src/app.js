@@ -17,10 +17,8 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 const BOOK_DEPTH = {
     pagesPerLayer: 50,
     maxLayers: 6,
-    step: 2,
-    edgeColor: '#e8e8e8',
-    gapColor: 'rgba(0,0,0,0.15)',
-    ambientShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
+    normalWidth: 5,   // px
+    highlightMul: 8,  // P.1ハイライト層: normalWidth の8倍
 };
 
 // ---- State ----
@@ -66,6 +64,7 @@ const els = {
     fileName: document.getElementById("file-name"),
     statusInfo: document.getElementById("status-info"),
     viewerContainer: document.getElementById("viewer-container"),
+    bookDepthWrapper: document.getElementById("book-depth-wrapper"),
 };
 
 // ---- PDF Loading ----
@@ -119,7 +118,7 @@ async function openFileFromData(uint8Array, fileName) {
 
         // Initialize thumbnails AFTER basic render setup
         await renderPage(state.currentPage);
-        updateBookDepth();
+        updateBookEdges();
         initThumbnails();
 
         els.statusInfo.textContent = "";
@@ -241,7 +240,7 @@ function goToPage(pageNum) {
     const page = Math.max(1, Math.min(pageNum, state.totalPages));
     if (page !== state.currentPage) {
         renderPage(page);
-        updateBookDepth();
+        updateBookEdges();
     }
 }
 
@@ -259,27 +258,54 @@ function updateNavButtons() {
 }
 
 // ---- Book Depth ----
-function calcBookDepthLayers(currentPage, totalPages) {
+function calcNumLayers(currentPage, totalPages) {
     const remaining = totalPages - currentPage;
     return Math.min(BOOK_DEPTH.maxLayers, Math.ceil(remaining / BOOK_DEPTH.pagesPerLayer));
 }
 
-function generateBookShadow(layers) {
-    if (layers <= 0) return BOOK_DEPTH.ambientShadow;
-    const shadows = [];
-    for (let i = 1; i <= layers; i++) {
-        const o = i * BOOK_DEPTH.step;
-        shadows.push(`${o - 1}px ${o - 1}px 0 0 ${BOOK_DEPTH.edgeColor}`);
-        shadows.push(`${o}px ${o}px 0 0 ${BOOK_DEPTH.gapColor}`);
-    }
-    const total = layers * BOOK_DEPTH.step;
-    shadows.push(`${total + 4}px ${total + 4}px 16px rgba(0,0,0,0.4)`);
-    return shadows.join(', ');
+// 層インデックス → ページ番号（全レイヤーが [2, numPages] を均等に表現）
+function getLayerPageNumber(layerIndex, numLayers, numPages) {
+    if (numLayers <= 1) return numPages;
+    return Math.min(numPages, Math.round(2 + (layerIndex / (numLayers - 1)) * (numPages - 2)));
 }
 
-function updateBookDepth() {
-    const layers = calcBookDepthLayers(state.currentPage, state.totalPages);
-    els.canvas.style.boxShadow = generateBookShadow(layers);
+// P.1 がどの層かを算出（currentPage > 1 の時のみ意味を持つ）
+function getHighlightedLayerIndex(currentPage, numPages, numLayers) {
+    if (currentPage <= 1 || numLayers <= 0) return -1;
+    return Math.min(
+        Math.floor((currentPage - 2) / (numPages - 2) * numLayers),
+        numLayers - 1
+    );
+}
+
+function updateBookEdges() {
+    if (!state.pdf) return;
+    const wrapper = els.bookDepthWrapper;
+    wrapper.querySelectorAll('.page-edge-layer').forEach(el => el.remove());
+
+    const numLayers = calcNumLayers(state.currentPage, state.totalPages);
+    if (numLayers === 0) return;
+
+    const highlightIdx = getHighlightedLayerIndex(state.currentPage, state.totalPages, numLayers);
+    let cumLeft = 0;
+
+    for (let i = 0; i < numLayers; i++) {
+        const isHighlighted = (i === highlightIdx);
+        const w = isHighlighted
+            ? BOOK_DEPTH.normalWidth * BOOK_DEPTH.highlightMul
+            : BOOK_DEPTH.normalWidth;
+        const pageNum = isHighlighted ? 1 : getLayerPageNumber(i, numLayers, state.totalPages);
+
+        const layer = document.createElement('div');
+        layer.className = 'page-edge-layer' + (isHighlighted ? ' highlighted' : '');
+        layer.style.left = `calc(100% + ${cumLeft}px)`;
+        layer.style.width = w + 'px';
+        layer.dataset.targetPage = pageNum;
+        layer.title = `P. ${pageNum}`;
+
+        wrapper.appendChild(layer);
+        cumLeft += w;
+    }
 }
 
 // ---- Zoom ----
@@ -643,6 +669,14 @@ function handleWheel(e) {
 }
 
 // ---- Event Listeners ----
+
+// Book depth: イベント委譲で一度だけ登録
+els.bookDepthWrapper.addEventListener('click', (e) => {
+    const edge = e.target.closest('.page-edge-layer');
+    if (!edge) return;
+    goToPage(Number(edge.dataset.targetPage));
+});
+
 els.btnOpen.addEventListener("click", openFile);
 els.btnWelcomeOpen.addEventListener("click", openFile);
 els.btnPrev.addEventListener("click", prevPage);
