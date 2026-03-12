@@ -23,6 +23,8 @@ const state = {
     rendering: false,
     pendingPage: null,
     outline: null,
+    activeSidebarTab: 'toc',
+    thumbObserver: null,
 };
 
 // ---- DOM Elements ----
@@ -35,6 +37,7 @@ const els = {
     btnZoomOut: document.getElementById("btn-zoom-out"),
     btnFitWidth: document.getElementById("btn-fit-width"),
     btnToc: document.getElementById("btn-toc"),
+    btnThumbnails: document.getElementById("btn-thumbnails"),
     btnTocClose: document.getElementById("btn-toc-close"),
     pageInput: document.getElementById("page-input"),
     pageTotal: document.getElementById("page-total"),
@@ -45,6 +48,10 @@ const els = {
     canvas: document.getElementById("pdf-canvas"),
     textLayer: document.getElementById("text-layer"),
     tocPanel: document.getElementById("toc-panel"),
+    tocPane: document.getElementById("toc-pane"),
+    thumbnailsPane: document.getElementById("thumbnails-pane"),
+    thumbnailsList: document.getElementById("thumbnails-list"),
+    sidebarTabs: document.querySelectorAll(".sidebar-tab"),
     tocList: document.getElementById("toc-list"),
     fileName: document.getElementById("file-name"),
     statusInfo: document.getElementById("status-info"),
@@ -53,18 +60,30 @@ const els = {
 
 // ---- PDF Loading ----
 
-/** ファイルパスを直接渡してPDFを読み込む共通処理 */
+/** ファイルパスを直接渡してPDFを読み込む（Tauri環境用） */
 async function openFileByPath(filePath) {
     try {
         els.statusInfo.textContent = "読み込み中...";
-        state.filePath = filePath;
-
-        // Read file bytes via Tauri fs plugin
         const fileBytes = await readFile(filePath);
+        const pathParts = filePath.replace(/\\/g, "/").split("/");
+        await openFileFromData(fileBytes, pathParts[pathParts.length - 1]);
+    } catch (err) {
+        console.error("Failed to open PDF:", err);
+        els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
+    }
+}
 
-        // Load PDF with PDF.js
-        const typedArray = new Uint8Array(fileBytes);
-        const loadingTask = pdfjsLib.getDocument({ data: typedArray });
+/** Uint8Array とファイル名を受け取ってPDFを描画する共通処理 */
+async function openFileFromData(uint8Array, fileName) {
+    try {
+        els.statusInfo.textContent = "読み込み中...";
+        if (state.pdf) {
+            state.pdf.destroy();
+            state.pdf = null;
+        }
+        state.filePath = fileName;
+
+        const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
         const pdf = await loadingTask.promise;
 
         state.pdf = pdf;
@@ -75,8 +94,7 @@ async function openFileByPath(filePath) {
         // Update UI
         els.pageTotal.textContent = state.totalPages;
         els.pageInput.max = state.totalPages;
-        const pathParts = filePath.replace(/\\/g, "/").split("/");
-        els.fileName.textContent = pathParts[pathParts.length - 1];
+        els.fileName.textContent = fileName;
 
         // Show PDF, hide welcome
         els.welcomeScreen.style.display = "none";
@@ -89,10 +107,12 @@ async function openFileByPath(filePath) {
         // Load outline
         loadOutline();
 
-        // Render first page
+        // Initialize thumbnails AFTER basic render setup
         await renderPage(state.currentPage);
+        initThumbnails();
 
         els.statusInfo.textContent = "";
+
     } catch (err) {
         console.error("Failed to open PDF:", err);
         els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
@@ -101,21 +121,36 @@ async function openFileByPath(filePath) {
 
 /** ダイアログでファイルを選択して開く */
 async function openFile() {
-    try {
-        const selected = await open({
-            multiple: false,
-            filters: [{ name: "PDF", extensions: ["pdf"] }],
-        });
+    if (window.__TAURI_INTERNALS__) {
+        // Tauri環境: ネイティブダイアログを使う
+        try {
+            const selected = await open({
+                multiple: false,
+                filters: [{ name: "PDF", extensions: ["pdf"] }],
+            });
 
-        if (!selected) return;
+            if (!selected) return;
 
-        const filePath = typeof selected === "string" ? selected : selected.path;
-        if (!filePath) return;
+            const filePath = typeof selected === "string" ? selected : selected.path;
+            if (!filePath) return;
 
-        await openFileByPath(filePath);
-    } catch (err) {
-        console.error("Failed to open PDF:", err);
-        els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
+            await openFileByPath(filePath);
+        } catch (err) {
+            console.error("Failed to open PDF:", err);
+            els.statusInfo.textContent = "エラー: ファイルを開けませんでした";
+        }
+    } else {
+        // ブラウザ環境: input要素を動的生成してファイル選択
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".pdf";
+        input.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            els.statusInfo.textContent = "読み込み中...";
+            await openFileFromData(new Uint8Array(await file.arrayBuffer()), file.name);
+        };
+        input.click();
     }
 }
 
@@ -132,6 +167,7 @@ async function renderPage(pageNum) {
     state.currentPage = pageNum;
     els.pageInput.value = pageNum;
     updateNavButtons();
+    updateActiveThumbnail(pageNum);
 
     try {
         const page = await state.pdf.getPage(pageNum);
@@ -295,8 +331,169 @@ function renderOutline(items, container = null, level = 0) {
     }
 }
 
-function toggleToc() {
-    els.tocPanel.classList.toggle("hidden");
+function switchSidebarTab(tab) {
+    state.activeSidebarTab = tab;
+    els.sidebarTabs.forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.tab === tab);
+    });
+    els.tocPane.classList.toggle("active", tab === "toc");
+    els.thumbnailsPane.classList.toggle("active", tab === "thumbnails");
+
+    if (tab === "thumbnails") {
+        setTimeout(() => {
+            const active = els.thumbnailsList.querySelector(".thumb-item.active");
+            if (active) active.scrollIntoView({ block: "nearest", behavior: "smooth" });
+            ensureVisibleThumbnailsRendered();
+        }, 0);
+    }
+}
+
+function ensureVisibleThumbnailsRendered() {
+    if (!state.pdf || !state.thumbObserver) return;
+    requestAnimationFrame(() => {
+        const listRect = els.thumbnailsList.getBoundingClientRect();
+        if (listRect.width === 0 || listRect.height === 0) return;
+        const margin = 200;
+        els.thumbnailsList.querySelectorAll(".thumb-item").forEach(item => {
+            if (item.dataset.loaded) return;
+            const rect = item.getBoundingClientRect();
+            if (rect.bottom > listRect.top - margin && rect.top < listRect.bottom + margin) {
+                item.dataset.loaded = "true";
+                item.dataset.visible = "true";
+                state.thumbObserver.unobserve(item);
+                renderThumbnailItem(item, parseInt(item.dataset.page, 10));
+            }
+        });
+    });
+}
+
+function toggleSidebar(preferredTab) {
+    const isHidden = els.tocPanel.classList.contains("hidden");
+    if (isHidden) {
+        els.tocPanel.classList.remove("hidden");
+        switchSidebarTab(preferredTab);
+    } else if (state.activeSidebarTab === preferredTab) {
+        els.tocPanel.classList.add("hidden");
+    } else {
+        switchSidebarTab(preferredTab);
+    }
+}
+
+// ---- Thumbnails ----
+const THUMB_WIDTH = 220;
+
+function initThumbnails() {
+    if (state.thumbObserver) {
+        state.thumbObserver.disconnect();
+        state.thumbObserver = null;
+    }
+
+    els.thumbnailsList.innerHTML = "";
+
+    for (let i = 1; i <= state.totalPages; i++) {
+        const item = document.createElement("div");
+        item.className = "thumb-item";
+        item.dataset.page = i;
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "thumb-canvas-wrapper";
+
+        const placeholder = document.createElement("div");
+        placeholder.className = "thumb-placeholder";
+        wrapper.appendChild(placeholder);
+
+        const label = document.createElement("span");
+        label.className = "thumb-label";
+        label.textContent = i;
+
+        item.appendChild(wrapper);
+        item.appendChild(label);
+
+        item.addEventListener("click", () => goToPage(parseInt(item.dataset.page, 10)));
+
+        els.thumbnailsList.appendChild(item);
+    }
+
+    state.thumbObserver = new IntersectionObserver(
+        (entries, obs) => {
+            for (const entry of entries) {
+                const item = entry.target;
+                if (entry.isIntersecting) {
+                    item.dataset.visible = "true";
+                    setTimeout(() => {
+                        if (item.dataset.visible === "true" && !item.dataset.loaded) {
+                            item.dataset.loaded = "true";
+                            obs.unobserve(item);
+                            renderThumbnailItem(item, parseInt(item.dataset.page, 10));
+                        }
+                    }, 150);
+                } else {
+                    item.dataset.visible = "false";
+                }
+            }
+        },
+        {
+            root: els.thumbnailsList,
+            rootMargin: "200px 0px",
+            threshold: 0,
+        }
+    );
+
+    els.thumbnailsList.querySelectorAll(".thumb-item").forEach(item => {
+        state.thumbObserver.observe(item);
+    });
+
+    updateActiveThumbnail(state.currentPage);
+}
+
+async function renderThumbnailItem(item, pageNum) {
+    const currentPdf = state.pdf;
+    if (!currentPdf) return;
+
+    try {
+        const page = await currentPdf.getPage(pageNum);
+        if (state.pdf !== currentPdf) return;
+
+        const naturalViewport = page.getViewport({ scale: 1.0 });
+        const displayScale = THUMB_WIDTH / naturalViewport.width;
+        // Reduce devicePixelRatio factor slightly for performance if needed, but keeping text crisp:
+        const renderScale = displayScale * window.devicePixelRatio;
+
+        const renderViewport = page.getViewport({ scale: renderScale });
+        const displayViewport = page.getViewport({ scale: displayScale });
+
+        const canvas = document.createElement("canvas");
+        canvas.width = renderViewport.width;
+        canvas.height = renderViewport.height;
+        canvas.style.width = displayViewport.width + "px";
+        canvas.style.height = displayViewport.height + "px";
+
+        const renderContext = {
+            canvasContext: canvas.getContext("2d"),
+            viewport: renderViewport,
+        };
+
+        await page.render(renderContext).promise;
+
+        const wrapper = item.querySelector(".thumb-canvas-wrapper");
+        wrapper.innerHTML = ""; // Clear placeholder
+        wrapper.appendChild(canvas);
+    } catch (err) {
+        console.error(`Thumbnail render error for page ${pageNum}:`, err);
+    }
+}
+
+function updateActiveThumbnail(pageNum) {
+    const prev = els.thumbnailsList.querySelector(".thumb-item.active");
+    if (prev) prev.classList.remove("active");
+
+    const next = els.thumbnailsList.querySelector(`.thumb-item[data-page="${pageNum}"]`);
+    if (next) {
+        next.classList.add("active");
+        if (state.activeSidebarTab === "thumbnails" && !els.tocPanel.classList.contains("hidden")) {
+            next.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        }
+    }
 }
 
 // ---- Search ----
@@ -417,8 +614,10 @@ els.btnNext.addEventListener("click", nextPage);
 els.btnZoomIn.addEventListener("click", zoomIn);
 els.btnZoomOut.addEventListener("click", zoomOut);
 els.btnFitWidth.addEventListener("click", fitWidth);
-els.btnToc.addEventListener("click", toggleToc);
-els.btnTocClose.addEventListener("click", toggleToc);
+els.btnToc.addEventListener("click", () => toggleSidebar("toc"));
+els.btnThumbnails.addEventListener("click", () => toggleSidebar("thumbnails"));
+els.btnTocClose.addEventListener("click", () => els.tocPanel.classList.add("hidden"));
+els.sidebarTabs.forEach(tab => tab.addEventListener("click", () => switchSidebarTab(tab.dataset.tab)));
 els.searchInput.addEventListener("input", handleSearch);
 
 document.addEventListener("keydown", handleKeyboard);
@@ -438,14 +637,24 @@ document.addEventListener("dragover", (e) => {
 document.addEventListener("drop", async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    // Tauri might pass file paths differently; this is a fallback
+    const file = e.dataTransfer.files[0];
+    if (file && file.name.toLowerCase().endsWith(".pdf")) {
+        els.statusInfo.textContent = "読み込み中...";
+        await openFileFromData(new Uint8Array(await file.arrayBuffer()), file.name);
+    }
 });
 
 // ---- 起動引数 / ファイルダブルクリックで開く ----
-// Rust側から "open-pdf" イベントでパスが送信されてくる
-await listen("open-pdf", (event) => {
-    const filePath = event.payload;
-    if (filePath && filePath.toLowerCase().endsWith(".pdf")) {
-        openFileByPath(filePath);
+// Rust側から "open-pdf" イベントでパスが送信されてくる（Tauri環境のみ）
+if (window.__TAURI_INTERNALS__) {
+    try {
+        await listen("open-pdf", (event) => {
+            const filePath = event.payload;
+            if (filePath && filePath.toLowerCase().endsWith(".pdf")) {
+                openFileByPath(filePath);
+            }
+        });
+    } catch (err) {
+        console.error("Tauriイベントリスナーの登録に失敗しました:", err);
     }
-});
+}

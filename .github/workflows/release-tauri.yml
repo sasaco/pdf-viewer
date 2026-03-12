@@ -1,0 +1,136 @@
+name: Release Tauri App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-release:
+    name: Check Release
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "app_version=$version" >> $GITHUB_OUTPUT
+          echo "tag=v$version" >> $GITHUB_OUTPUT
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.tag }}")
+          if [ "$response" = "200" ]; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Release ${{ steps.version.outputs.tag }} already exists, skipping"
+          else
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: macos-arm
+            os: macos-latest
+          - platform: macos-intel
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+          - platform: linux
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build and release Tauri app
+        uses: tauri-apps/tauri-action@v0.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ needs.check-release.outputs.tag }}
+          releaseName: "PDF Viewer ${{ needs.check-release.outputs.app_version }}"
+          releaseBody: |
+            ## PDF Viewer ${{ needs.check-release.outputs.app_version }}
+
+            PyMuPDF ベースの Tauri デスクトップ PDF ビューアのリリースです。
+
+            ### ダウンロード
+
+            #### Windows
+            - **インストーラー**: `.exe` (NSIS)
+            - **MSI**: `.msi`
+
+            #### macOS
+            - **DMG (Apple Silicon)**: `.dmg` (M1以降)
+            - **DMG (Intel)**: `.dmg` (x86_64)
+
+            #### Linux
+            - **AppImage**: `.AppImage`
+            - **Debian**: `.deb`
+
+            ### インストール方法
+
+            - **Windows**: NSIS インストーラーを実行してください
+            - **macOS**: DMG ファイルを開き、アプリをアプリケーションフォルダにドラッグしてください
+            - **Linux**: AppImage を実行可能にして (`chmod +x`) 起動するか、.deb パッケージをインストールしてください
+          args: ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
+          releaseDraft: false
+          prerelease: false
