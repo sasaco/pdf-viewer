@@ -1,5 +1,3 @@
 node_modules/
 dist/
-tests/big*.pdf
-tests/test2.pdf
 src-tauri/target/

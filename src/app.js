@@ -375,13 +375,20 @@ function updateEdgeGeometry() {
     for (let i = count - 1; i >= 0; i--) {
         const currentCumX = cumX[i];
         const currentCumY = cumY[i];
-        const rect = edgeRects[i];
-        // PDF 左端からオフセット（矩形は PDF の背後に置かれ、右端・上端からはみ出す）
-        rect.x(originX + currentCumX);
-        // 上へのズレ: 手前 (i 小) ほど上に配置
-        rect.y(originY - currentCumY);
-        rect.width(konvaDisplayW);
-        rect.height(konvaDisplayH);
+        const node = edgeRects[i];
+        
+        node.x(originX + currentCumX);
+        node.y(originY - currentCumY);
+        
+        if (node instanceof Konva.Group) {
+            node.getChildren().forEach(child => {
+                child.width(konvaDisplayW);
+                child.height(konvaDisplayH);
+            });
+        } else {
+            node.width(konvaDisplayW);
+            node.height(konvaDisplayH);
+        }
     }
 
     // 右側 hit polygon 更新
@@ -471,26 +478,52 @@ function drawBookEdge(displayW, displayH) {
         const currentCumX = cumX[i];
         const currentCumY = cumY[i];
 
-        const rectConfig = {
-            x: originX + currentCumX,
-            y: originY - currentCumY,
-            width:  displayW,
-            height: displayH,
-            stroke: 'rgba(0,0,0,0.18)',
-            strokeWidth: 1,
-            listening: false,
-        };
+        if (i === konvaHighlightedIdx) {
+            const group = new Konva.Group({
+                x: originX + currentCumX,
+                y: originY - currentCumY,
+                listening: false,
+            });
 
-        if (i === 0) {
-            rectConfig.fillPatternImage = stripeCanvas;
-            rectConfig.fillPatternRepeat = 'repeat';
+            const stripe = new Konva.Rect({
+                x: 0,
+                y: 0,
+                width: displayW,
+                height: displayH,
+                fillPatternImage: stripeCanvas,
+                fillPatternRepeat: 'repeat',
+                stroke: 'rgba(0,0,0,0.18)',
+                strokeWidth: 1,
+            });
+
+            const whiteGap = new Konva.Rect({
+                x: -EDGE_INTERVAL,
+                y: EDGE_INTERVAL,
+                width: displayW,
+                height: displayH,
+                fill: 'white',
+                stroke: 'rgba(0,0,0,0.18)',
+                strokeWidth: 1,
+            });
+
+            group.add(stripe);
+            group.add(whiteGap);
+            konvaLayer.add(group);
+            edgeRects[i] = group;
         } else {
-            rectConfig.fill = '#f5f5f5';
+            const rect = new Konva.Rect({
+                x: originX + currentCumX,
+                y: originY - currentCumY,
+                width:  displayW,
+                height: displayH,
+                fill: '#f5f5f5',
+                stroke: 'rgba(0,0,0,0.18)',
+                strokeWidth: 1,
+                listening: false,
+            });
+            konvaLayer.add(rect);
+            edgeRects[i] = rect;
         }
-
-        const rect = new Konva.Rect(rectConfig);
-        konvaLayer.add(rect);
-        edgeRects[i] = rect;
     }
 
     // 右側 ヒット用透明ポリゴン
