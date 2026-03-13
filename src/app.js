@@ -6,6 +6,16 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
+import Konva from "konva";
+import {
+    calcEdgeCount,
+    calcMaxEdgePx,
+    getHighlightedIndex,
+    getRectWidths,
+    calcCumulative,
+    getPageForIndex,
+    EDGE_INTERVAL,
+} from "./bookEdge.js";
 
 // PDF.js worker setup
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -13,13 +23,20 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
     import.meta.url
 ).toString();
 
-// ---- Book Depth Config ----
-const BOOK_DEPTH = {
-    pagesPerLayer: 50,
-    maxLayers: 6,
-    normalWidth: 5,   // px
-    highlightMul: 8,  // P.1ハイライト層: normalWidth の8倍
-};
+// ---- Canvas padding（ページ数確定後に動的計算、初期値は暫定値） ----
+// calcMaxEdgePx(totalPages) が確定したら updateCanvasPad() で更新する。
+let CANVAS_PAD_TOP   = 100;  // 暫定値（PDF ロード前のレイアウト用）
+let CANVAS_PAD_RIGHT = 100;
+const CANVAS_PAD_LEFT = 24;  // 固定（fitWidth 計算用）
+
+/** totalPages が確定したあとに padding を再計算する */
+function updateCanvasPad(totalPages) {
+    const maxEdge = calcMaxEdgePx(totalPages);
+    CANVAS_PAD_TOP   = 24 + maxEdge;
+    CANVAS_PAD_RIGHT = 24 + maxEdge;
+    els.pdfContainer.style.paddingTop   = CANVAS_PAD_TOP   + 'px';
+    els.pdfContainer.style.paddingRight = CANVAS_PAD_RIGHT + 'px';
+}
 
 // ---- State ----
 const state = {
@@ -67,6 +84,18 @@ const els = {
     bookDepthWrapper: document.getElementById("book-depth-wrapper"),
 };
 
+// ---- Konva State ----
+let konvaStage  = null;
+let konvaLayer  = null;
+let edgeRects   = [];
+let hitRight    = null;
+let hitTop      = null;
+let konvaHoveredIdx    = -1;
+let konvaHighlightedIdx = -1;
+let konvaRafPending    = false;
+let konvaDisplayW = 0;
+let konvaDisplayH = 0;
+
 // ---- PDF Loading ----
 
 /** ファイルパスを直接渡してPDFを読み込む（Tauri環境用） */
@@ -100,6 +129,9 @@ async function openFileFromData(uint8Array, fileName) {
         state.currentPage = 1;
         state.scale = 1.0;
 
+        // ページ数確定後にパディングを再計算
+        updateCanvasPad(state.totalPages);
+
         // Update UI
         els.pageTotal.textContent = state.totalPages;
         els.pageInput.max = state.totalPages;
@@ -113,12 +145,15 @@ async function openFileFromData(uint8Array, fileName) {
         updateNavButtons();
         updateZoomDisplay();
 
+        // Konva ステージを初期化（PDF ごとに 1 回）
+        initKonva();
+
         // Load outline
         loadOutline();
 
         // Initialize thumbnails AFTER basic render setup
+        // drawBookEdge は renderPage 完了後に自動呼び出されるため不要
         await renderPage(state.currentPage);
-        updateBookEdges();
         initThumbnails();
 
         els.statusInfo.textContent = "";
@@ -198,6 +233,10 @@ async function renderPage(pageNum) {
         els.bookDepthWrapper.style.width = widthPx;
         els.bookDepthWrapper.style.height = heightPx;
 
+        // Konva エッジ描画用にサイズを保持
+        konvaDisplayW = displayViewport.width;
+        konvaDisplayH = displayViewport.height;
+
         const renderContext = {
             canvasContext: context,
             viewport: viewport,
@@ -218,8 +257,8 @@ async function renderPage(pageNum) {
             );
 
             const fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
-            span.style.left = tx[4] + 24 + "px"; // 24px padding offset
-            span.style.top = tx[5] - fontSize + 24 + "px";
+            span.style.left = tx[4] + CANVAS_PAD_LEFT + "px";
+            span.style.top  = tx[5] - fontSize + CANVAS_PAD_TOP + "px";
             span.style.fontSize = fontSize + "px";
             span.style.fontFamily = item.fontName || "sans-serif";
             span.textContent = item.str;
@@ -234,6 +273,9 @@ async function renderPage(pageNum) {
 
     state.rendering = false;
 
+    // ページサイズ確定後（wrapper width/height 設定後）に Konva エッジを再描画
+    drawBookEdge(konvaDisplayW, konvaDisplayH);
+
     if (state.pendingPage !== null) {
         const nextPage = state.pendingPage;
         state.pendingPage = null;
@@ -246,8 +288,11 @@ function goToPage(pageNum) {
     if (!state.pdf) return;
     const page = Math.max(1, Math.min(pageNum, state.totalPages));
     if (page !== state.currentPage) {
+        // updateBookEdges() は renderPage() の完了後に呼ぶ必要がある。
+        // renderPage 内部で wrapper の width/height を確定するため、
+        // ここで先に呼ぶと古いサイズのまま edge が配置される。
+        // → renderPage の末尾（state.rendering = false の後）で呼ぶ設計に変更済み。
         renderPage(page);
-        updateBookEdges();
     }
 }
 
@@ -264,59 +309,261 @@ function updateNavButtons() {
     els.btnNext.disabled = !state.pdf || state.currentPage >= state.totalPages;
 }
 
-// ---- Book Depth ----
-function calcNumLayers(currentPage, totalPages) {
-    const remaining = totalPages - currentPage;
-    return Math.min(BOOK_DEPTH.maxLayers, Math.ceil(remaining / BOOK_DEPTH.pagesPerLayer));
-}
+// ---- Konva Book Edge ----
 
-// 層インデックス → ページ番号（全レイヤーが [2, numPages] を均等に表現）
-function getLayerPageNumber(layerIndex, numLayers, numPages) {
-    if (numLayers <= 1) return numPages;
-    return Math.min(numPages, Math.round(2 + (layerIndex / (numLayers - 1)) * (numPages - 2)));
-}
-
-// P.1 がどの層かを算出（currentPage > 1 の時のみ意味を持つ）
-function getHighlightedLayerIndex(currentPage, numPages, numLayers) {
-    if (currentPage <= 1 || numLayers <= 0) return -1;
-    return Math.min(
-        Math.floor((currentPage - 2) / (numPages - 2) * numLayers),
-        numLayers - 1
-    );
-}
-
-function updateBookEdges() {
-    if (!state.pdf) return;
-    const wrapper = els.bookDepthWrapper;
-    
-    // 現在のキャンバス要素を退避し、ラッパーの中身を空にしてから戻す（安全で確実なクリア）
-    const canvas = els.canvas;
-    wrapper.innerHTML = '';
-    wrapper.appendChild(canvas);
-
-    const numLayers = calcNumLayers(state.currentPage, state.totalPages);
-    if (numLayers === 0) return;
-
-    const highlightIdx = getHighlightedLayerIndex(state.currentPage, state.totalPages, numLayers);
-    let cumLeft = 0;
-
-    for (let i = 0; i < numLayers; i++) {
-        const isHighlighted = (i === highlightIdx);
-        const w = isHighlighted
-            ? BOOK_DEPTH.normalWidth * BOOK_DEPTH.highlightMul
-            : BOOK_DEPTH.normalWidth;
-        const pageNum = isHighlighted ? 1 : getLayerPageNumber(i, numLayers, state.totalPages);
-
-        const layer = document.createElement('div');
-        layer.className = 'page-edge-layer' + (isHighlighted ? ' highlighted' : '');
-        layer.style.left = `calc(100% + ${cumLeft}px)`;
-        layer.style.width = w + 'px';
-        layer.dataset.targetPage = pageNum;
-        layer.title = `P. ${pageNum}`;
-
-        wrapper.appendChild(layer);
-        cumLeft += w;
+/** Konva Stage と Layer を初期化する（PDF ロード時に 1 回呼ぶ） */
+function initKonva() {
+    // 既存 Stage があれば破棄
+    if (konvaStage) {
+        konvaStage.destroy();
+        konvaStage = null;
+        konvaLayer = null;
+        edgeRects = [];
+        hitRight = null;
+        hitTop = null;
     }
+
+    // konva-mount div を取得または作成
+    let mountDiv = document.getElementById('konva-mount');
+    if (!mountDiv) {
+        mountDiv = document.createElement('div');
+        mountDiv.id = 'konva-mount';
+        els.bookDepthWrapper.insertBefore(mountDiv, els.bookDepthWrapper.firstChild);
+    }
+
+    konvaStage = new Konva.Stage({
+        container: 'konva-mount',
+        width: 1,
+        height: 1,
+    });
+    konvaLayer = new Konva.Layer();
+    konvaStage.add(konvaLayer);
+    konvaHoveredIdx = -1;
+}
+
+/**
+ * エッジの Konva ノード（Rect × count、透明 Line × 2）を
+ * 現在の状態に合わせて更新する。
+ * hoveredIdx/-1 が変化したときだけ呼ばれる差分更新関数。
+ */
+function updateEdgeGeometry() {
+    if (!konvaLayer || edgeRects.length === 0) return;
+
+    const count = edgeRects.length;
+    const widths = getRectWidths(count, konvaHoveredIdx, konvaHighlightedIdx);
+    const cumX = calcCumulative(widths);
+    const cumY = calcCumulative(widths); // X/Y は同幅
+
+    const maxEdge = calcMaxEdgePx(state.totalPages);
+    const originX = 0;       // PDF 左端 x（矩形は PDF の背後から始まる）
+    const originY = maxEdge; // Stage 座標系での PDF 上端 y
+
+    for (let i = count - 1; i >= 0; i--) {
+        const prevCumX = i === 0 ? 0 : cumX[i - 1];
+        const prevCumY = i === 0 ? 0 : cumY[i - 1];
+        const rect = edgeRects[i];
+        // PDF 左端からオフセット（矩形は PDF の背後に置かれ、右端・上端からはみ出す）
+        rect.x(originX + prevCumX);
+        // 上へのズレ: 手前 (i 小) ほど上に配置
+        rect.y(originY - prevCumY);
+        rect.width(konvaDisplayW);
+        rect.height(konvaDisplayH + prevCumY);
+    }
+
+    // 右側 hit polygon 更新
+    const totalEdge = cumX[count - 1];
+    if (hitRight) {
+        hitRight.points([
+            originX + konvaDisplayW, originY,
+            originX + konvaDisplayW + totalEdge, originY - totalEdge,
+            originX + konvaDisplayW + totalEdge, originY + konvaDisplayH - totalEdge,
+            originX + konvaDisplayW, originY + konvaDisplayH,
+        ]);
+    }
+    if (hitTop) {
+        hitTop.points([
+            originX, originY,
+            originX + totalEdge, originY - totalEdge,
+            originX + konvaDisplayW + totalEdge, originY - totalEdge,
+            originX + konvaDisplayW, originY,
+        ]);
+    }
+
+    konvaLayer.batchDraw();
+}
+
+/**
+ * ページ再描画後に呼ぶ全面再構築関数。
+ * Konva ノードを全て作り直し、イベントを再バインドする。
+ * @param {number} displayW  CSS 表示幅 (px)
+ * @param {number} displayH  CSS 表示高さ (px)
+ */
+function drawBookEdge(displayW, displayH) {
+    if (!state.pdf || !konvaStage || !konvaLayer) return;
+
+    konvaDisplayW = displayW;
+    konvaDisplayH = displayH;
+
+    const count = calcEdgeCount(state.totalPages);
+    konvaHighlightedIdx = getHighlightedIndex(
+        state.currentPage,
+        state.totalPages,
+        count
+    );
+
+    // Stage のサイズを PDF + エッジ領域に合わせる
+    const maxEdge = calcMaxEdgePx(state.totalPages);
+    const stageW = displayW + maxEdge;
+    const stageH = displayH + maxEdge;
+    konvaStage.width(stageW);
+    konvaStage.height(stageH);
+
+    // Stage の絶対位置を「PDF canvas の左上」に揃えるため、
+    // wrapper 内で (0, 0) が PDF 左上になるよう配置している。
+    // エッジは右（+x）・上（-y → Stage 内で y < 0 にならないよう上方向に余白が必要）
+    // → Stage の DOM 位置を top: -maxEdge, left: 0 にしてオフセット
+    const mountDiv = document.getElementById('konva-mount');
+    if (mountDiv) {
+        mountDiv.style.position = 'absolute';
+        mountDiv.style.top      = (-maxEdge) + 'px';
+        mountDiv.style.left     = '0px';
+        mountDiv.style.zIndex   = '0';
+    }
+    // Stage を mountDiv のオフセット分だけ y 方向にずらす
+    // → Konva の y 座標 0 = PDF 上端、負 y = 上エッジ領域
+    // Stage 自体は top:-maxEdge なので、PDF 上端は Stage 内で y = maxEdge
+    const originY = maxEdge; // Stage 座標系での PDF 上端 y
+    const originX = 0;       // PDF 左端 x
+
+    // Layer クリア
+    konvaLayer.destroyChildren();
+    edgeRects = [];
+    hitRight = null;
+    hitTop = null;
+
+    if (count === 0) {
+        konvaLayer.batchDraw();
+        return;
+    }
+
+    const widths = getRectWidths(count, konvaHoveredIdx, konvaHighlightedIdx);
+    const cumX = calcCumulative(widths);
+    const cumY = calcCumulative(widths);
+
+    // 矩形を奥（大インデックス）から手前（小インデックス）の順で追加
+    // 各矩形は PDF と同サイズ（displayW × displayH）で PDF の背後に重なるように配置。
+    // originX + prevCumX = PDF 左端からオフセット → 右端と上端だけがはみ出して見える。
+    for (let i = count - 1; i >= 0; i--) {
+        const prevCumX = i === 0 ? 0 : cumX[i - 1];
+        const prevCumY = i === 0 ? 0 : cumY[i - 1];
+
+        const rect = new Konva.Rect({
+            x: originX + prevCumX,
+            y: originY - prevCumY,
+            width:  displayW,
+            height: displayH + prevCumY,
+            fill: '#f5f5f5',
+            stroke: 'rgba(0,0,0,0.18)',
+            strokeWidth: 1,
+            listening: false,
+        });
+        konvaLayer.add(rect);
+        edgeRects[i] = rect;
+    }
+
+    // 右側 ヒット用透明ポリゴン
+    const totalEdge = cumX[count - 1];
+    hitRight = new Konva.Line({
+        points: [
+            originX + displayW, originY,
+            originX + displayW + totalEdge, originY - totalEdge,
+            originX + displayW + totalEdge, originY + displayH - totalEdge,
+            originX + displayW, originY + displayH,
+        ],
+        closed: true,
+        opacity: 0,
+        listening: true,
+    });
+
+    // 上側 ヒット用透明ポリゴン
+    hitTop = new Konva.Line({
+        points: [
+            originX, originY,
+            originX + totalEdge, originY - totalEdge,
+            originX + displayW + totalEdge, originY - totalEdge,
+            originX + displayW, originY,
+        ],
+        closed: true,
+        opacity: 0,
+        listening: true,
+    });
+
+    // ---- イベントハンドラ共通ロジック ----
+    function getHoveredIdxFromEvent(e, isRight) {
+        const pos = konvaStage.getPointerPosition();
+        if (!pos) return -1;
+        const localX = pos.x - (isRight ? (originX + displayW) : originX);
+        const localY = (originY) - pos.y;
+        // 右エッジ: x 方向で判定
+        const axis = isRight ? localX : localY;
+        if (axis < 0) return -1;
+        for (let i = 0; i < cumX.length; i++) {
+            const start = i === 0 ? 0 : cumX[i - 1];
+            const end = cumX[i];
+            if (axis >= start && axis < end) return i;
+        }
+        return count - 1;
+    }
+
+    function onHoverMove(e, isRight) {
+        const newIdx = getHoveredIdxFromEvent(e, isRight);
+        if (newIdx === konvaHoveredIdx) return;
+        konvaHoveredIdx = newIdx;
+        if (!konvaRafPending) {
+            konvaRafPending = true;
+            requestAnimationFrame(() => {
+                konvaRafPending = false;
+                updateEdgeGeometry();
+            });
+        }
+    }
+
+    function onLeave() {
+        if (konvaHoveredIdx === -1) return;
+        konvaHoveredIdx = -1;
+        if (!konvaRafPending) {
+            konvaRafPending = true;
+            requestAnimationFrame(() => {
+                konvaRafPending = false;
+                updateEdgeGeometry();
+            });
+        }
+    }
+
+    function onClick(e, isRight) {
+        const idx = getHoveredIdxFromEvent(e, isRight);
+        if (idx < 0) return;
+        const page = getPageForIndex(
+            idx,
+            konvaHighlightedIdx,
+            state.currentPage,
+            state.totalPages,
+            count
+        );
+        goToPage(page);
+    }
+
+    hitRight.on('mousemove', (e) => onHoverMove(e, true));
+    hitRight.on('mouseleave', onLeave);
+    hitRight.on('click', (e) => onClick(e, true));
+    hitTop.on('mousemove', (e) => onHoverMove(e, false));
+    hitTop.on('mouseleave', onLeave);
+    hitTop.on('click', (e) => onClick(e, false));
+
+    konvaLayer.add(hitRight);
+    konvaLayer.add(hitTop);
+
+    konvaLayer.batchDraw();
 }
 
 // ---- Zoom ----
@@ -340,9 +587,10 @@ async function fitWidth() {
     if (!state.pdf) return;
     const page = await state.pdf.getPage(state.currentPage);
     const viewport = page.getViewport({ scale: 1.0 });
-    const containerWidth = els.viewerContainer.clientWidth - 80; // padding
-    const newScale = containerWidth / viewport.width;
-    setZoom(newScale);
+    // CANVAS_PAD_RIGHT（右余白）＋ CANVAS_PAD_LEFT（左余白）＋ スクロールバー幅
+    const hPad = CANVAS_PAD_RIGHT + CANVAS_PAD_LEFT + 16;
+    const containerWidth = els.viewerContainer.clientWidth - hPad;
+    setZoom(containerWidth / viewport.width);
 }
 
 function updateZoomDisplay() {
@@ -681,16 +929,52 @@ function handleWheel(e) {
 
 // ---- Event Listeners ----
 
-// Book depth: イベント委譲で一度だけ登録
-els.bookDepthWrapper.addEventListener('click', (e) => {
-    const edge = e.target.closest('.page-edge-layer');
-    if (!edge || !edge.dataset.targetPage) return; // targetPageが無い場合は無視
-    
-    const pageNum = Number(edge.dataset.targetPage);
-    if (!isNaN(pageNum)) {
-        goToPage(pageNum);
+// ---- Middle Mouse Button Pan ----
+(function initMiddleMousePan() {
+    let isPanning  = false;
+    let startX     = 0;
+    let startY     = 0;
+    let scrollLeft = 0;
+    let scrollTop  = 0;
+    const container = els.viewerContainer;
+
+    function stopPanning() {
+        isPanning = false;
+        container.classList.remove('is-panning');
     }
-});
+
+    container.addEventListener('mousedown', (e) => {
+        if (e.button !== 1) return;
+        e.preventDefault(); // ブラウザのオートスクロール抑制
+        isPanning  = true;
+        startX     = e.clientX;
+        startY     = e.clientY;
+        scrollLeft = container.scrollLeft;
+        scrollTop  = container.scrollTop;
+        container.classList.add('is-panning');
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isPanning) return;
+        e.preventDefault(); // パン中テキスト選択を抑制
+        container.scrollLeft = scrollLeft - (e.clientX - startX);
+        container.scrollTop  = scrollTop  - (e.clientY - startY);
+    });
+
+    window.addEventListener('mouseup', () => {
+        if (isPanning) stopPanning();
+    });
+
+    // ウィンドウフォーカスが外れた場合も確実に解除
+    window.addEventListener('blur', () => {
+        if (isPanning) stopPanning();
+    });
+
+    // 中ボタンデフォルト動作（オートスクロールアイコン表示）を抑制
+    container.addEventListener('auxclick', (e) => {
+        if (e.button === 1) e.preventDefault();
+    });
+})();
 
 els.btnOpen.addEventListener("click", openFile);
 els.btnWelcomeOpen.addEventListener("click", openFile);

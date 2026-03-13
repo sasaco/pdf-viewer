@@ -541,8 +541,9 @@ body {
 /* ---- PDF Container ---- */
 #pdf-container {
   position: relative;
+  /* padding-top / padding-right は JS（CANVAS_PAD_TOP/RIGHT）で上書きされる */
   padding: 24px;
-  padding-right: 40px;
+  padding-right: 40px; /* JS 起動前のフォールバック */
   padding-bottom: 40px;
   display: flex;
   justify-content: center;
@@ -558,6 +559,7 @@ body {
   display: inline-block;
   flex-shrink: 0;
   z-index: 10;
+  overflow: visible; /* Konva エッジが wrapper 外（右・上方向）にはみ出すため必須 */
 }
 
 #pdf-canvas {
@@ -567,26 +569,22 @@ body {
   background: white;
 }
 
-.page-edge-layer {
+/* Konva エッジ Stage のマウント先 */
+#konva-mount {
   position: absolute;
-  top: 0;
-  height: 100%;
+  pointer-events: none; /* Stage 自体はクリックを透過させる */
   z-index: 0;
-  background: #f5f5f5;
-  border-right: 1px solid rgba(0, 0, 0, 0.18);
-  cursor: pointer;
-  box-sizing: border-box;
-  transition: width 0.12s ease, background 0.12s ease;
 }
 
-.page-edge-layer:not(.highlighted):hover {
-  width: 20px !important; /* normalWidth(5) * hoverMul(4) */
-  background: #e8e8f8;
+/* Konva の canvas 要素はクリックを受け取る（listening: true の Line のみ有効） */
+#konva-mount canvas {
+  pointer-events: auto;
 }
 
-.page-edge-layer.highlighted {
-  background: #ebebeb;
-  border-right: 1px solid rgba(0, 0, 0, 0.25);
+/* パン中カーソル */
+#viewer-container.is-panning {
+  cursor: grabbing !important;
+  user-select: none;
 }
 
 #text-layer {
