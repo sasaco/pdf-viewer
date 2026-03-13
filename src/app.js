@@ -96,6 +96,20 @@ let konvaRafPending    = false;
 let konvaDisplayW = 0;
 let konvaDisplayH = 0;
 
+// ---- Stripe Pattern Canvas ----
+const stripeCanvas = document.createElement('canvas');
+stripeCanvas.width = 6;
+stripeCanvas.height = 6;
+const sCtx = stripeCanvas.getContext('2d');
+sCtx.fillStyle = '#f5f5f5';
+sCtx.fillRect(0, 0, 6, 6);
+sCtx.strokeStyle = 'rgba(0,0,0,0.2)';
+sCtx.lineWidth = 1;
+sCtx.beginPath();
+sCtx.moveTo(0, 6);
+sCtx.lineTo(6, 0);
+sCtx.stroke();
+
 // ---- PDF Loading ----
 
 /** ファイルパスを直接渡してPDFを読み込む（Tauri環境用） */
@@ -359,15 +373,15 @@ function updateEdgeGeometry() {
     const originY = maxEdge; // Stage 座標系での PDF 上端 y
 
     for (let i = count - 1; i >= 0; i--) {
-        const prevCumX = i === 0 ? 0 : cumX[i - 1];
-        const prevCumY = i === 0 ? 0 : cumY[i - 1];
+        const currentCumX = cumX[i];
+        const currentCumY = cumY[i];
         const rect = edgeRects[i];
         // PDF 左端からオフセット（矩形は PDF の背後に置かれ、右端・上端からはみ出す）
-        rect.x(originX + prevCumX);
+        rect.x(originX + currentCumX);
         // 上へのズレ: 手前 (i 小) ほど上に配置
-        rect.y(originY - prevCumY);
+        rect.y(originY - currentCumY);
         rect.width(konvaDisplayW);
-        rect.height(konvaDisplayH + prevCumY);
+        rect.height(konvaDisplayH);
     }
 
     // 右側 hit polygon 更新
@@ -452,21 +466,29 @@ function drawBookEdge(displayW, displayH) {
 
     // 矩形を奥（大インデックス）から手前（小インデックス）の順で追加
     // 各矩形は PDF と同サイズ（displayW × displayH）で PDF の背後に重なるように配置。
-    // originX + prevCumX = PDF 左端からオフセット → 右端と上端だけがはみ出して見える。
+    // originX + currentCumX = PDF 左端からオフセット → 右端と上端だけがはみ出して見える。
     for (let i = count - 1; i >= 0; i--) {
-        const prevCumX = i === 0 ? 0 : cumX[i - 1];
-        const prevCumY = i === 0 ? 0 : cumY[i - 1];
+        const currentCumX = cumX[i];
+        const currentCumY = cumY[i];
 
-        const rect = new Konva.Rect({
-            x: originX + prevCumX,
-            y: originY - prevCumY,
+        const rectConfig = {
+            x: originX + currentCumX,
+            y: originY - currentCumY,
             width:  displayW,
-            height: displayH + prevCumY,
-            fill: '#f5f5f5',
+            height: displayH,
             stroke: 'rgba(0,0,0,0.18)',
             strokeWidth: 1,
             listening: false,
-        });
+        };
+
+        if (i === 0) {
+            rectConfig.fillPatternImage = stripeCanvas;
+            rectConfig.fillPatternRepeat = 'repeat';
+        } else {
+            rectConfig.fill = '#f5f5f5';
+        }
+
+        const rect = new Konva.Rect(rectConfig);
         konvaLayer.add(rect);
         edgeRects[i] = rect;
     }
