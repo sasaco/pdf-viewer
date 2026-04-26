@@ -9,24 +9,35 @@
     "core:default",
     "dialog:default",
     "dialog:allow-open",
-    "fs:default",
+    "dialog:allow-save",
     {
       "identifier": "fs:allow-read-file",
       "allow": [
         {
-          "path": "$HOME/**"
+          "path": "$DOCUMENT/**/*.pdf"
         },
         {
-          "path": "$DOCUMENT/**"
+          "path": "$DESKTOP/**/*.pdf"
         },
         {
-          "path": "$DESKTOP/**"
+          "path": "$DOWNLOAD/**/*.pdf"
         },
         {
-          "path": "$DOWNLOAD/**"
+          "path": "$HOME/**/*.pdf"
+        }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [
+        {
+          "path": "$DOCUMENT/**/*.md"
         },
         {
-          "path": "**/*.pdf"
+          "path": "$DESKTOP/**/*.md"
+        },
+        {
+          "path": "$DOWNLOAD/**/*.md"
         }
       ]
     }

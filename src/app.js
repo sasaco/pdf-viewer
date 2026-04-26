@@ -2,11 +2,12 @@
    PDF Viewer - Application Logic
    ============================================ */
 
-import { open } from "@tauri-apps/plugin-dialog";
-import { readFile } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { readFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
 import Konva from "konva";
+import { convertPdfDocumentToMarkdown } from "./markdown/convert.js";
 import {
     calcEdgeCount,
     calcMaxEdgePx,
@@ -50,7 +51,21 @@ const state = {
     outline: null,
     activeSidebarTab: 'toc',
     thumbObserver: null,
+    mdConverting: false,
+    mdAbortController: null,
+    pendingDownloadUrl: null,
 };
+
+window.addEventListener("beforeunload", () => {
+    if (state.pendingDownloadUrl) {
+        try {
+            URL.revokeObjectURL(state.pendingDownloadUrl);
+        } catch (_) {
+            /* ignore */
+        }
+        state.pendingDownloadUrl = null;
+    }
+});
 
 // ---- DOM Elements ----
 const els = {
@@ -63,6 +78,8 @@ const els = {
     btnFitWidth: document.getElementById("btn-fit-width"),
     btnToc: document.getElementById("btn-toc"),
     btnThumbnails: document.getElementById("btn-thumbnails"),
+    btnMdCopy: document.getElementById("btn-md-copy"),
+    btnMdSave: document.getElementById("btn-md-save"),
     btnTocClose: document.getElementById("btn-toc-close"),
     pageInput: document.getElementById("page-input"),
     pageTotal: document.getElementById("page-total"),
@@ -128,9 +145,15 @@ async function openFileByPath(filePath) {
 /** Uint8Array とファイル名を受け取ってPDFを描画する共通処理 */
 async function openFileFromData(uint8Array, fileName) {
     try {
+        // 進行中の MD 変換があればキャンセル（race ガード + リソース節約）
+        abortPendingMdConversion();
         els.statusInfo.textContent = "読み込み中...";
         if (state.pdf) {
-            state.pdf.destroy();
+            try {
+                await state.pdf.destroy();
+            } catch (e) {
+                console.warn("PDF destroy failed:", e?.message ?? e);
+            }
             state.pdf = null;
         }
         state.filePath = fileName;
@@ -286,6 +309,8 @@ async function renderPage(pageNum) {
     }
 
     state.rendering = false;
+    // rendering 終了後に MD ボタン等の disable 状態を再計算する
+    updateNavButtons();
 
     // ページサイズ確定後（wrapper width/height 設定後）に Konva エッジを再描画
     drawBookEdge(konvaDisplayW, konvaDisplayH);
@@ -321,6 +346,180 @@ function nextPage() {
 function updateNavButtons() {
     els.btnPrev.disabled = !state.pdf || state.currentPage <= 1;
     els.btnNext.disabled = !state.pdf || state.currentPage >= state.totalPages;
+    const mdReady = !!state.pdf && !state.rendering && !state.mdConverting;
+    if (els.btnMdCopy) els.btnMdCopy.disabled = !mdReady;
+    if (els.btnMdSave) els.btnMdSave.disabled = !mdReady;
+}
+
+// ---- Markdown 変換 ----
+/** 進行中の MD 変換を中止する（PDF 差替え時に呼ぶ）。 */
+function abortPendingMdConversion() {
+    if (state.mdAbortController) {
+        try {
+            state.mdAbortController.abort();
+        } catch (_) {
+            /* ignore */
+        }
+        state.mdAbortController = null;
+    }
+}
+
+/** 開いている PDF を Markdown 文字列に変換する。
+ *  - 成功時: `{ md: string, pageErrorCount: number }` を返す。
+ *  - 失敗・空抽出・PDF 差替え・abort のいずれでも `null` を返し、適切なメッセージを表示。
+ *  - rendering 中は弾く（UI disable に頼らない関数内ガード）。
+ */
+async function convertCurrentPdfToMarkdown() {
+    if (!state.pdf) {
+        els.statusInfo.textContent = "PDFが開かれていません";
+        return null;
+    }
+    if (state.rendering) {
+        els.statusInfo.textContent = "ページ描画中です。しばらくお待ちください";
+        return null;
+    }
+    const pdfAtStart = state.pdf;
+    abortPendingMdConversion();
+    const controller = new AbortController();
+    state.mdAbortController = controller;
+    state.mdConverting = true;
+    updateNavButtons();
+    els.statusInfo.textContent = "Markdown 変換中...";
+    let pageErrorCount = 0;
+    const failedPages = [];
+    try {
+        const md = await convertPdfDocumentToMarkdown(pdfAtStart, {
+            signal: controller.signal,
+            onPageError: (_e, p) => {
+                pageErrorCount++;
+                if (failedPages.length < 10) failedPages.push(p);
+            },
+        });
+        // race ガード: 別 PDF / 別 controller なら UI を上書きせず破棄
+        if (state.pdf !== pdfAtStart || state.mdAbortController !== controller) {
+            return null;
+        }
+        if (!md || !md.trim()) {
+            els.statusInfo.textContent =
+                "テキストを抽出できませんでした（スキャン PDF の可能性）";
+            return null;
+        }
+        return { md, pageErrorCount, failedPages };
+    } catch (err) {
+        // race ガード: 別 PDF に切り替わっていたら status を汚さない
+        if (state.pdf !== pdfAtStart || state.mdAbortController !== controller) {
+            return null;
+        }
+        if (err?.name === "AbortError") {
+            els.statusInfo.textContent = "Markdown 変換をキャンセルしました";
+            return null;
+        }
+        console.error("Markdown conversion failed:", err?.message ?? err);
+        els.statusInfo.textContent = "エラー: Markdown 変換に失敗しました";
+        return null;
+    } finally {
+        if (state.mdAbortController === controller) {
+            state.mdAbortController = null;
+        }
+        state.mdConverting = false;
+        updateNavButtons();
+    }
+}
+
+/** pageErrorCount に応じてサフィックスを生成。 */
+function mdResultSuffix(result) {
+    if (!result || result.pageErrorCount === 0) return "";
+    const sample = result.failedPages.slice(0, 5).join(", ");
+    const more = result.failedPages.length > 5 ? "..." : "";
+    return `（${result.pageErrorCount} ページ抽出失敗: ${sample}${more}）`;
+}
+
+async function copyMarkdownToClipboard() {
+    const result = await convertCurrentPdfToMarkdown();
+    if (result == null) return;
+    if (!navigator.clipboard?.writeText) {
+        els.statusInfo.textContent =
+            "エラー: この環境ではクリップボードに書き込めません";
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(result.md);
+        els.statusInfo.textContent =
+            "Markdown をコピーしました" + mdResultSuffix(result);
+    } catch (err) {
+        console.error("Clipboard write failed:", err?.message ?? err);
+        els.statusInfo.textContent = "エラー: クリップボードに書き込めませんでした";
+    }
+}
+
+async function saveMarkdownToFile() {
+    const result = await convertCurrentPdfToMarkdown();
+    if (result == null) return;
+    const md = result.md;
+    // ユーザー由来のファイル名にパス区切り（/, \）が混入する余地を排除
+    const rawName = state.filePath || "document.pdf";
+    const baseName =
+        rawName
+            .replace(/[\\/]/g, "_")
+            .replace(/\.pdf$/i, "") || "document";
+    const defaultPath = `${baseName}.md`;
+    if (window.__TAURI_INTERNALS__) {
+        try {
+            const target = await save({
+                defaultPath,
+                filters: [{ name: "Markdown", extensions: ["md"] }],
+            });
+            if (!target) return; // ユーザーキャンセル: silent に return（メッセージ出さない）
+            if (typeof target !== "string") {
+                els.statusInfo.textContent = "エラー: 保存先パスを取得できませんでした";
+                return;
+            }
+            // フロント側でも .md 拡張子を再確認（capabilities が拒否する前のフィードバック向上）
+            if (!target.toLowerCase().endsWith(".md")) {
+                els.statusInfo.textContent = "エラー: .md ファイル以外は保存できません";
+                return;
+            }
+            await writeTextFile(target, md);
+            els.statusInfo.textContent =
+                "Markdown を保存しました" + mdResultSuffix(result);
+        } catch (err) {
+            console.error("Markdown save failed:", err?.message ?? err);
+            els.statusInfo.textContent = "エラー: Markdown を保存できませんでした";
+        }
+    } else {
+        // ブラウザ環境フォールバック: anchor + Blob でダウンロードをリクエスト。
+        // 連打時のメモリリーク防止のため、Blob URL は同時に 1 件のみ保持し
+        // 次回呼び出し時／beforeunload 時に revoke する。
+        try {
+            if (state.pendingDownloadUrl) {
+                URL.revokeObjectURL(state.pendingDownloadUrl);
+                state.pendingDownloadUrl = null;
+            }
+            const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+            const url = URL.createObjectURL(blob);
+            state.pendingDownloadUrl = url;
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = defaultPath;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            // a.click() はキックするだけ。ブラウザが Blob を取得する前に
+            // revoke されないよう、60s 後に revoke する（その間に次の保存があれば即 revoke）。
+            setTimeout(() => {
+                if (state.pendingDownloadUrl === url) {
+                    URL.revokeObjectURL(url);
+                    state.pendingDownloadUrl = null;
+                }
+            }, 60_000);
+            els.statusInfo.textContent =
+                "ダウンロードをリクエストしました（保存先はブラウザ設定）" +
+                mdResultSuffix(result);
+        } catch (err) {
+            console.error("Browser download failed:", err?.message ?? err);
+            els.statusInfo.textContent = "エラー: ダウンロードを開始できませんでした";
+        }
+    }
 }
 
 // ---- Konva Book Edge ----
@@ -1038,6 +1237,8 @@ els.btnNext.addEventListener("click", nextPage);
 els.btnZoomIn.addEventListener("click", zoomIn);
 els.btnZoomOut.addEventListener("click", zoomOut);
 els.btnFitWidth.addEventListener("click", fitWidth);
+if (els.btnMdCopy) els.btnMdCopy.addEventListener("click", copyMarkdownToClipboard);
+if (els.btnMdSave) els.btnMdSave.addEventListener("click", saveMarkdownToFile);
 els.btnToc.addEventListener("click", () => toggleSidebar("toc"));
 els.btnThumbnails.addEventListener("click", () => toggleSidebar("thumbnails"));
 els.btnTocClose.addEventListener("click", () => els.tocPanel.classList.add("hidden"));
